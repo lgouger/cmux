@@ -3059,6 +3059,8 @@ class TerminalController {
             return v2Result(id: id, self.v2BrowserScrollIntoView(params: params))
         case "browser.screenshot":
             return v2Result(id: id, self.v2BrowserScreenshot(params: params))
+        case "terminal.screenshot":
+            return v2Result(id: id, self.v2TerminalScreenshot(params: params))
         case "browser.get.text":
             return v2Result(id: id, self.v2BrowserGetText(params: params))
         case "browser.get.html":
@@ -3390,6 +3392,7 @@ class TerminalController {
             "browser.scroll",
             "browser.scroll_into_view",
             "browser.screenshot",
+            "terminal.screenshot",
             "browser.get.text",
             "browser.get.html",
             "browser.get.value",
@@ -11157,6 +11160,84 @@ class TerminalController {
         }
     }
 
+    private func v2TerminalScreenshot(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to capture screenshot", data: nil)
+        v2MainSync {
+            guard let ws = v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId: UUID?
+            if params["surface_id"] != nil {
+                surfaceId = v2UUID(params, "surface_id")
+                guard surfaceId != nil else {
+                    result = .err(code: "not_found", message: "Surface not found for the given surface_id", data: nil)
+                    return
+                }
+            } else {
+                surfaceId = ws.focusedPanelId
+            }
+            guard let surfaceId else {
+                result = .err(code: "not_found", message: "No focused surface", data: nil)
+                return
+            }
+            guard let terminalPanel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "invalid_params", message: "Surface is not a terminal", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+
+            // Capture the terminal's IOSurface directly, avoiding Screen Recording permissions.
+            let view = terminalPanel.hostedView
+            var cgImage = view.copyIOSurfaceCGImage()
+            if cgImage == nil {
+                // If the surface is mid-attach we may not have contents yet. Nudge a draw and retry once.
+                terminalPanel.surface.forceRefresh(reason: "v2.terminalScreenshot.retry")
+                cgImage = view.copyIOSurfaceCGImage()
+            }
+            guard let cgImage else {
+                result = .err(code: "internal_error", message: "Failed to capture terminal image", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+
+            let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
+            guard let imageData = bitmapRep.representation(using: .png, properties: [:]) else {
+                result = .err(code: "internal_error", message: "Failed to encode PNG", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+
+            var payload: [String: Any] = [
+                "workspace_id": ws.id.uuidString,
+                "workspace_ref": v2Ref(kind: .workspace, uuid: ws.id),
+                "surface_id": surfaceId.uuidString,
+                "surface_ref": v2Ref(kind: .surface, uuid: surfaceId),
+                "png_base64": imageData.base64EncodedString()
+            ]
+
+            // Best effort: keep screenshot data available even when temp-file writes fail.
+            let screenshotsDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("cmux-terminal-screenshots", isDirectory: true)
+            if (try? FileManager.default.createDirectory(at: screenshotsDirectory, withIntermediateDirectories: true)) != nil {
+                bestEffortPruneTemporaryFiles(in: screenshotsDirectory)
+                let timestampMs = Int(Date().timeIntervalSince1970 * 1000)
+                let shortSurfaceId = String(surfaceId.uuidString.prefix(8))
+                let shortRandomId = String(UUID().uuidString.prefix(8))
+                let filename = "surface-\(shortSurfaceId)-\(timestampMs)-\(shortRandomId).png"
+                let imageURL = screenshotsDirectory.appendingPathComponent(filename, isDirectory: false)
+                if (try? imageData.write(to: imageURL, options: .atomic)) != nil {
+                    payload["path"] = imageURL.path
+                    payload["url"] = imageURL.absoluteString
+                }
+            }
+
+            result = .ok(payload)
+        }
+        return result
+    }
+
     private func v2BrowserGetText(params: [String: Any]) -> V2CallResult {
         v2BrowserSelectorAction(params: params, actionName: "get.text") { selectorLiteral in
             """
@@ -15793,11 +15874,11 @@ class TerminalController {
 
             // Capture the terminal's IOSurface directly, avoiding Screen Recording permissions.
             let view = terminalPanel.hostedView
-            var cgImage = view.debugCopyIOSurfaceCGImage()
+            var cgImage = view.copyIOSurfaceCGImage()
             if cgImage == nil {
                 // If the surface is mid-attach we may not have contents yet. Nudge a draw and retry once.
                 terminalPanel.surface.forceRefresh(reason: "terminalController.debugCopyIOSurfaceRetry")
-                cgImage = view.debugCopyIOSurfaceCGImage()
+                cgImage = view.copyIOSurfaceCGImage()
             }
             guard let cgImage else {
                 result = "ERROR: Failed to capture panel image"

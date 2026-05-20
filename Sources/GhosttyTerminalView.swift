@@ -12853,32 +12853,12 @@ final class GhosttySurfaceScrollView: NSView {
     }
 #endif
 
-#if DEBUG
-    struct DebugFrameSample {
-        let sampleCount: Int
-        let uniqueQuantized: Int
-        let lumaStdDev: Double
-        let modeFraction: Double
-        let fingerprint: UInt64
-        let iosurfaceWidthPx: Int
-        let iosurfaceHeightPx: Int
-        let expectedWidthPx: Int
-        let expectedHeightPx: Int
-        let layerClass: String
-        let layerContentsGravity: String
-        let layerContentsKey: String
-
-        var isProbablyBlank: Bool {
-            (lumaStdDev < 3.5 && modeFraction > 0.985) ||
-            (uniqueQuantized <= 6 && modeFraction > 0.95)
-        }
-    }
-
     /// Create a CGImage from the terminal's IOSurface-backed layer contents.
     ///
     /// This avoids Screen Recording permissions (unlike CGWindowListCreateImage) and is therefore
-    /// suitable for debug socket tests running in headless/VM contexts.
-    func debugCopyIOSurfaceCGImage() -> CGImage? {
+    /// suitable for production screenshot capture as well as debug socket tests running in
+    /// headless/VM contexts.
+    func copyIOSurfaceCGImage() -> CGImage? {
         guard let modelLayer = surfaceView.layer else { return nil }
         let layer = modelLayer.presentation() ?? modelLayer
         guard let contents = layer.contents else { return nil }
@@ -12918,6 +12898,27 @@ final class GhosttySurfaceScrollView: NSView {
             shouldInterpolate: false,
             intent: .defaultIntent
         )
+    }
+
+#if DEBUG
+    struct DebugFrameSample {
+        let sampleCount: Int
+        let uniqueQuantized: Int
+        let lumaStdDev: Double
+        let modeFraction: Double
+        let fingerprint: UInt64
+        let iosurfaceWidthPx: Int
+        let iosurfaceHeightPx: Int
+        let expectedWidthPx: Int
+        let expectedHeightPx: Int
+        let layerClass: String
+        let layerContentsGravity: String
+        let layerContentsKey: String
+
+        var isProbablyBlank: Bool {
+            (lumaStdDev < 3.5 && modeFraction > 0.985) ||
+            (uniqueQuantized <= 6 && modeFraction > 0.95)
+        }
     }
 
     /// Sample the IOSurface backing the terminal layer (if any) to detect a transient blank frame
