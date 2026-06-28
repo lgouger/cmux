@@ -1830,9 +1830,6 @@ struct ContentView: View {
                 .accessibilityHidden(sidebarSelectionState.selection != .notifications)
         }
         .padding(.top, effectiveTitlebarPadding)
-        .overlay(alignment: .top) {
-            PaneMemoryGuardrailBanner(guardrail: PaneMemoryGuardrail.shared, tabManager: tabManager)
-        }
     }
 
     private func terminalContentWithSidebarDropOverlay(appearance: WindowAppearanceSnapshot) -> some View {
@@ -2110,7 +2107,7 @@ struct ContentView: View {
                 }
 
                 Text(titlebarText)
-                    .font(.system(size: 13, weight: .bold))
+                    .cmuxFont(size: 13, weight: .bold)
                     .foregroundColor(fakeTitlebarTextColor(appearance: appearance))
                     .lineLimit(1)
                     .allowsHitTesting(false)
@@ -2226,7 +2223,7 @@ struct ContentView: View {
         }
     }
 
-    private func updateTitlebarText() {
+    @MainActor private func updateTitlebarText() {
         guard let selectedId = tabManager.selectedTabId,
               let tab = tabManager.tabs.first(where: { $0.id == selectedId }) else {
             if !titlebarText.isEmpty {
@@ -2241,7 +2238,7 @@ struct ContentView: View {
         }
     }
 
-    private func scheduleTitlebarTextRefresh() {
+    @MainActor private func scheduleTitlebarTextRefresh() {
         titlebarTextUpdateCoalescer.signal {
             updateTitlebarText()
         }
@@ -2644,8 +2641,13 @@ struct ContentView: View {
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDidSetTitle)) { notification in
-            guard GhosttyTitleChange(notification: notification)?.tabId == tabManager.selectedTabId else { return }
+            guard tabManager.shouldScheduleRawTitleRefresh(forWorkspaceId: GhosttyTitleChange(notification: notification)?.tabId) else { return }
             scheduleTitlebarTextRefresh()
+        })
+
+        view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .workspaceTitleDidChange, object: tabManager)) { notification in
+            guard let workspaceId = notification.userInfo?[GhosttyNotificationKey.tabId] as? UUID, workspaceId == tabManager.selectedTabId, !tabManager.shouldScheduleRawTitleRefresh(forWorkspaceId: workspaceId) else { return }
+            updateTitlebarText()
         })
 
         view = AnyView(view.onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { notification in
@@ -3567,7 +3569,7 @@ struct ContentView: View {
         case .singleLine(let accessibilityIdentifier, let focus, let onDeleteBackward):
             TextField(placeholder, text: text)
                 .textFieldStyle(.plain)
-                .font(.system(size: 13, weight: .regular))
+                .cmuxFont(size: 13, weight: .regular)
                 .tint(Color(nsColor: sidebarActiveForegroundNSColor(opacity: 1.0)))
                 .focused(focus)
                 .accessibilityIdentifier(accessibilityIdentifier)
@@ -3616,7 +3618,7 @@ struct ContentView: View {
             Divider()
 
             Text(renameInputHintText(target: target))
-                .font(.system(size: 11))
+                .cmuxFont(size: 11)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -3648,7 +3650,7 @@ struct ContentView: View {
 
         return VStack(spacing: 0) {
             Text(nextName)
-                .font(.system(size: 13, weight: .regular))
+                .cmuxFont(size: 13, weight: .regular)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 9)
@@ -3657,7 +3659,7 @@ struct ContentView: View {
             Divider()
 
             Text(renameConfirmHintText(target: target))
-                .font(.system(size: 11))
+                .cmuxFont(size: 11)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -3706,7 +3708,7 @@ struct ContentView: View {
             Divider()
 
             Text(target.inputHint)
-                .font(.system(size: 11))
+                .cmuxFont(size: 11)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -3783,6 +3785,7 @@ struct ContentView: View {
         let onEscape: () -> Void
         let onMoveSelection: (Int) -> Void
         let onUnhandledNavigationKey: (NSEvent) -> Bool
+        @Environment(\.cmuxGlobalFontMagnificationPercent) private var globalFontPercent
 
         @MainActor final class Coordinator: NSObject, NSTextFieldDelegate {
             var parent: CommandPaletteSearchFieldRepresentable
@@ -3906,7 +3909,7 @@ struct ContentView: View {
 
         func makeNSView(context: Context) -> CommandPaletteNativeTextField {
             let field = CommandPaletteNativeTextField(frame: .zero)
-            field.font = .systemFont(ofSize: 13)
+            field.font = GlobalFontMagnification.systemFont(ofSize: 13)
             field.placeholderString = placeholder
             field.setAccessibilityIdentifier("CommandPaletteSearchField")
             field.delegate = context.coordinator
@@ -3925,6 +3928,7 @@ struct ContentView: View {
             context.coordinator.parent = self
             context.coordinator.parentField = nsView
             nsView.placeholderString = placeholder
+            nsView.font = GlobalFontMagnification.systemFont(ofSize: 13)
 
             if let editor = nsView.currentEditor() as? NSTextView {
                 context.coordinator.attachEditorTextDidChangeObserverIfNeeded(editor)
@@ -4106,16 +4110,19 @@ struct ContentView: View {
     }
 
     private final class CommandPaletteMultilineTextEditorView: NSView {
-        private static let font = NSFont.systemFont(ofSize: 13)
+        private static var font: NSFont {
+            GlobalFontMagnification.systemFont(ofSize: 13)
+        }
         private static let textInset = NSSize(width: 0, height: 2)
-        static let defaultMinimumHeight: CGFloat = {
+        static var defaultMinimumHeight: CGFloat {
             let lineHeight = ceil(font.ascender - font.descender + font.leading)
             return lineHeight * 5 + textInset.height * 2
-        }()
+        }
 
         private let scrollView = NSScrollView(frame: .zero)
         let textView = CommandPaletteMultilineTextView(frame: .zero)
         private let placeholderField = CommandPalettePassthroughLabel(labelWithString: "")
+        private var fontMagnificationObserver: GlobalFontMagnificationChangeObserver?
         var onMeasuredHeightChange: ((CGFloat) -> Void)?
         private var lastReportedHeight: CGFloat?
         var maximumHeight: CGFloat = .greatestFiniteMagnitude {
@@ -4151,7 +4158,7 @@ struct ContentView: View {
             textView.isVerticallyResizable = true
             textView.backgroundColor = .clear
             textView.drawsBackground = false
-            textView.font = Self.font
+            applyFonts()
             textView.textColor = .labelColor
             textView.insertionPointColor = .labelColor
             textView.textContainerInset = Self.textInset
@@ -4166,7 +4173,6 @@ struct ContentView: View {
             scrollView.documentView = textView
 
             placeholderField.translatesAutoresizingMaskIntoConstraints = false
-            placeholderField.font = Self.font
             placeholderField.textColor = .secondaryLabelColor
             placeholderField.lineBreakMode = .byWordWrapping
             placeholderField.maximumNumberOfLines = 0
@@ -4178,6 +4184,10 @@ struct ContentView: View {
                 name: NSText.didChangeNotification,
                 object: textView
             )
+            fontMagnificationObserver = GlobalFontMagnificationChangeObserver { [weak self] in
+                self?.applyFonts()
+                self?.refreshMetrics()
+            }
 
             NSLayoutConstraint.activate([
                 scrollView.topAnchor.constraint(equalTo: topAnchor),
@@ -4199,6 +4209,13 @@ struct ContentView: View {
 
         deinit {
             NotificationCenter.default.removeObserver(self)
+        }
+
+        private func applyFonts() {
+            let font = Self.font
+            textView.font = font
+            placeholderField.font = font
+            textView.minSize = NSSize(width: 0, height: Self.defaultMinimumHeight)
         }
 
         override func layout() {
@@ -4311,7 +4328,9 @@ struct ContentView: View {
     }
 
     private struct CommandPaletteMultilineTextEditorRepresentable: NSViewRepresentable {
-        static let defaultMinimumHeight = CommandPaletteMultilineTextEditorView.defaultMinimumHeight
+        static var defaultMinimumHeight: CGFloat {
+            CommandPaletteMultilineTextEditorView.defaultMinimumHeight
+        }
 
         let placeholder: String
         let accessibilityLabel: String
@@ -4322,6 +4341,7 @@ struct ContentView: View {
         let maxHeight: CGFloat
         let onSubmit: (String) -> Void
         let onEscape: () -> Void
+        @Environment(\.cmuxGlobalFontMagnificationPercent) private var globalFontPercent
 
         final class Coordinator: NSObject, NSTextViewDelegate {
             var parent: CommandPaletteMultilineTextEditorRepresentable
@@ -5192,7 +5212,7 @@ struct ContentView: View {
             switch trailingLabel.style {
             case .shortcut:
                 Text(trailingLabel.text)
-                    .font(.system(size: 11, weight: .medium))
+                    .cmuxFont(size: 11, weight: .medium)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
@@ -5202,7 +5222,7 @@ struct ContentView: View {
                     )
             case .kind:
                 Text(trailingLabel.text)
-                    .font(.system(size: 11, weight: .regular))
+                    .cmuxFont(size: 11, weight: .regular)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -5219,7 +5239,7 @@ struct ContentView: View {
                 title,
                 matchedIndices: matchedIndices
             )
-                .font(.system(size: 13, weight: .regular))
+                .cmuxFont(size: 13, weight: .regular)
                 .lineLimit(1)
             Spacer()
             commandPaletteRenderTrailingLabelView(trailingLabel)
@@ -6060,11 +6080,7 @@ struct ContentView: View {
         if let action = Self.commandPaletteShortcutAction(forCommandID: contribution.commandId) {
             let shortcut = KeyboardShortcutSettings.shortcut(for: action)
             guard !shortcut.isUnbound else { return nil }
-            guard action.shortcutContext.isAvailable(
-                focusedBrowserPanel: context.bool(CommandPaletteContextKeys.panelIsBrowser),
-                focusedMarkdownPanel: context.bool(CommandPaletteContextKeys.panelIsMarkdown),
-                rightSidebarFocused: false
-            ) else {
+            guard action.shortcutContext.isAvailable(commandPaletteContext: context) else {
                 return nil
             }
             return shortcut.displayString
@@ -9959,27 +9975,6 @@ extension SidebarDragState {
     }
 }
 
-/// Per-row drop-indicator visibility, computed by the parent from value
-/// inputs only. Takes UUIDs (not `Tab` objects or `SidebarDragState`) so it's
-/// trivially unit-testable and the row's view subtree never reads the
-/// `@Observable` store directly. Same predicate that used to live inside
-/// `SidebarTabDropIndicatorOverlay`.
-struct SidebarWorkspaceTopDropIndicator: View {
-    let isVisible: Bool
-    let isFirstRow: Bool
-    let rowSpacing: CGFloat
-
-    var body: some View {
-        if isVisible {
-            Rectangle()
-                .fill(cmuxAccentColor())
-                .frame(height: 2)
-                .padding(.horizontal, 8)
-                .offset(y: isFirstRow ? 0 : -(rowSpacing / 2))
-        }
-    }
-}
-
 /// Freezes `showsModifierShortcutHints` for the row whose context menu is open,
 /// so pressing/releasing the modifier key while the menu is up does not flip
 /// the underlying row's shortcut badges (which would be visible around the
@@ -10016,6 +10011,8 @@ struct VerticalTabsSidebar: View {
     // `SidebarDragState`, so they need a separate transient collection flag.
     @State private var isBonsplitWorkspaceDropTargetCollectionActive = false
     @State private var bonsplitWorkspaceDropTargetBridge = SidebarBonsplitTabWorkspaceDropOverlay.TargetBridge()
+    @State private var isWorkspaceReorderDropTargetCollectionActive = false
+    @State private var workspaceReorderDropTargetBridge = SidebarWorkspaceReorderDropOverlay.TargetBridge()
     // Freezes `showsModifierShortcutHints` for the workspace whose context menu
     // is open. Set on the row's contextMenu.onAppear and cleared on
     // .onDisappear so modifier-key transitions don't flip the badges on the
@@ -10225,7 +10222,8 @@ struct VerticalTabsSidebar: View {
         return SidebarTabDropIndicatorPredicate().emptyAreaTopVisible(
             draggedTabId: dragState.draggedTabId,
             dropIndicator: dragState.dropIndicator,
-            lastTabId: reorderIds.last
+            lastTabId: reorderIds.last,
+            indicatorScope: dragState.dropIndicatorScope
         )
     }
 
@@ -10243,6 +10241,28 @@ struct VerticalTabsSidebar: View {
             targetRowHeight: nil,
             dragAutoScrollController: dragAutoScrollController
         )
+    }
+
+    private func sidebarDropIndicatorRowIds(
+        draggedWorkspaceId: UUID,
+        scope: SidebarWorkspaceReorderDropIndicatorScope,
+        tabs: [Workspace],
+        workspaceGroups: [WorkspaceGroup],
+        visibleWorkspaceRowIds: [UUID]
+    ) -> [UUID] {
+        switch scope {
+        case .raw:
+            return tabs.map(\.id)
+        case .topLevel:
+            return tabManager.sidebarReorderWorkspaceIds(
+                forDraggedWorkspaceId: draggedWorkspaceId,
+                usesTopLevelRows: true
+            )
+        case .group(let groupId):
+            guard workspaceGroups.contains(where: { $0.id == groupId }) else { return [] }
+            let visibleIds = Set(visibleWorkspaceRowIds)
+            return tabs.filter { $0.groupId == groupId && visibleIds.contains($0.id) }.map(\.id)
+        }
     }
 
     private var sidebarTopScrimHeight: CGFloat {
@@ -10358,6 +10378,7 @@ struct VerticalTabsSidebar: View {
         let canCloseWorkspace: Bool
         let workspaceNumberShortcut: StoredShortcut
         let tabItemSettings: SidebarTabItemSettingsSnapshot
+        let pinResolutionContext: WorkspaceActionDispatcher.PinResolutionContext
         let tabIndexById: [UUID: Int]
         let workspaceById: [UUID: Workspace]
         let workspaceGroupIdByWorkspaceId: [UUID: UUID?]
@@ -10380,10 +10401,15 @@ struct VerticalTabsSidebar: View {
         let canCloseWorkspace = workspaceCount > 1
         let workspaceNumberShortcut = self.workspaceNumberShortcut
         let tabItemSettings = tabItemSettingsStore.snapshot
+        let tabIds = tabs.map(\.id)
         let tabIndexById = Dictionary(uniqueKeysWithValues: tabs.enumerated().map {
             ($0.element.id, $0.offset)
         })
         let workspaceById = Dictionary(uniqueKeysWithValues: tabs.map { ($0.id, $0) })
+        let pinResolutionContext = WorkspaceActionDispatcher.PinResolutionContext(
+            workspacesById: workspaceById,
+            liveWorkspaceIds: Set(tabIds)
+        )
         let workspaceGroupIdByWorkspaceId = Dictionary(uniqueKeysWithValues: tabs.map { ($0.id, $0.groupId) })
         let orderedSelectedTabs = tabs.filter { selectedTabIds.contains($0.id) }
         let selectedContextTargetIds = orderedSelectedTabs.map(\.id)
@@ -10406,20 +10432,25 @@ struct VerticalTabsSidebar: View {
         )
         let visibleWorkspaceRowIds = workspaceRenderItems.map(\.rowWorkspaceId)
         let draggedSidebarTabId = dragState.draggedTabId
+        let dropIndicatorScope = dragState.dropIndicatorScope
         let sidebarReorderIds = draggedSidebarTabId.map {
-            tabManager.sidebarReorderWorkspaceIds(
-                forDraggedWorkspaceId: $0,
-                usesTopLevelRows: dragState.dropIndicatorUsesTopLevelRows
+            sidebarDropIndicatorRowIds(
+                draggedWorkspaceId: $0,
+                scope: dropIndicatorScope,
+                tabs: tabs,
+                workspaceGroups: workspaceGroups,
+                visibleWorkspaceRowIds: visibleWorkspaceRowIds
             )
         } ?? []
         let renderContext = WorkspaceListRenderContext(
             tabs: tabs,
-            tabIds: tabs.map(\.id),
+            tabIds: tabIds,
             sidebarReorderIds: sidebarReorderIds,
             workspaceCount: workspaceCount,
             canCloseWorkspace: canCloseWorkspace,
             workspaceNumberShortcut: workspaceNumberShortcut,
             tabItemSettings: tabItemSettings,
+            pinResolutionContext: pinResolutionContext,
             tabIndexById: tabIndexById,
             workspaceById: workspaceById,
             workspaceGroupIdByWorkspaceId: workspaceGroupIdByWorkspaceId,
@@ -10467,6 +10498,7 @@ struct VerticalTabsSidebar: View {
             }
             dragState.clearDrag()
             isBonsplitWorkspaceDropTargetCollectionActive = false
+            isWorkspaceReorderDropTargetCollectionActive = false
             // Defensive reset: if a prior simulation died without running
             // its teardown (sidebar unmounted mid-loop, app crash, etc.) the
             // @State SidebarDragState could carry isSimulated=true into a
@@ -10486,6 +10518,7 @@ struct VerticalTabsSidebar: View {
             dragFailsafeMonitor.stop()
             dragState.clearDrag()
             isBonsplitWorkspaceDropTargetCollectionActive = false
+            isWorkspaceReorderDropTargetCollectionActive = false
             // Clear the simulator flag too so a re-mounted sidebar doesn't
             // inherit a stale bypass and skip the real-drag failsafe monitor.
             dragState.isSimulated = false
@@ -10590,23 +10623,6 @@ struct VerticalTabsSidebar: View {
                         .frame(height: sidebarTitlebarInteractionHeight)
                         .background(TitlebarDoubleClickMonitorView())
                 }
-                .overlay(alignment: .top) {
-                    if dragState.draggedTabId != nil, let firstWorkspaceId = renderContext.workspaceIds.first {
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .frame(height: scrollInsets.top + 8)
-                            .onDrop(of: SidebarTabDragPayload.dropContentTypes, delegate: SidebarTabDropDelegate(
-                                targetTabId: firstWorkspaceId,
-                                tabManager: tabManager,
-                                workspaceGroupIdByWorkspaceId: renderContext.workspaceGroupIdByWorkspaceId,
-                                dragState: dragState,
-                                selectedTabIds: $selectedTabIds,
-                                lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                                targetRowHeight: nil,
-                                dragAutoScrollController: dragAutoScrollController
-                            ))
-                    }
-                }
                 .overlay(alignment: .topLeading) {
                     if isMinimalMode {
                         HiddenTitlebarSidebarControlsView(
@@ -10639,6 +10655,14 @@ struct VerticalTabsSidebar: View {
                                 minimalModeSidebarTitlebarControlsTopPadding
                             )
                     }
+                }
+                .overlay(alignment: .top) {
+                    workspaceReorderDropOverlay(
+                        renderContext: renderContext,
+                        pointOffset: CGSize(width: 0, height: -scrollInsets.top)
+                    )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: scrollInsets.top)
                 }
                 .background(Color.clear)
                 .modifier(ClearScrollBackground())
@@ -11339,11 +11363,10 @@ struct VerticalTabsSidebar: View {
 
             Button(action: onNewTab) {
                 HStack(spacing: 9) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 15, weight: .regular))
+                    CmuxSystemSymbolImage(magnified: "plus", pointSize: 15, weight: .regular)
                         .frame(width: 22, height: 22)
                     Text(String(localized: "sidebar.browserStack.newTab", defaultValue: "New Tab"))
-                        .font(.system(size: 13, weight: .regular))
+                        .cmuxFont(size: 13, weight: .regular)
                     Spacer(minLength: 0)
                 }
                 .foregroundColor(.secondary)
@@ -11376,15 +11399,13 @@ struct VerticalTabsSidebar: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 14, weight: .regular))
+                CmuxSystemSymbolImage(magnified: "folder.fill", pointSize: 14, weight: .regular)
                     .foregroundColor(.secondary)
                 Text(extensionSidebarTreeSectionTitle(section.treeSection))
-                    .font(.system(size: 13, weight: .semibold))
+                    .cmuxFont(size: 13, weight: .semibold)
                     .foregroundColor(.primary.opacity(0.86))
                     .lineLimit(1)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 11, weight: .medium))
+                CmuxSystemSymbolImage(magnified: "chevron.down", pointSize: 11, weight: .medium)
                     .foregroundColor(.secondary)
                 Spacer(minLength: 0)
             }
@@ -11501,14 +11522,14 @@ struct VerticalTabsSidebar: View {
             HStack(spacing: 9) {
                 extensionBrowserStackIcon(row.leadingIcon, size: compact ? 22 : 24)
                 Text(row.title)
-                    .font(.system(size: compact ? 12.5 : 13, weight: .medium))
+                    .cmuxFont(size: compact ? 12.5 : 13, weight: .medium)
                     .foregroundColor(isSelected ? .primary : .primary.opacity(0.82))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 0)
                 if let trailing = extensionSidebarRenderedText(row.trailingText, now: now) {
                     Text(trailing)
-                        .font(.system(size: 11, weight: .regular))
+                        .cmuxFont(size: 11, weight: .regular)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                 }
@@ -11676,12 +11697,11 @@ struct VerticalTabsSidebar: View {
                 RoundedRectangle(cornerRadius: size * 0.24, style: .continuous).fill(background)
             }
             if let systemImageName = icon?.systemImageName {
-                Image(systemName: systemImageName)
-                    .font(.system(size: size * 0.58, weight: .semibold))
+                CmuxSystemSymbolImage(magnified: systemImageName, pointSize: size * 0.58, weight: .semibold)
                     .foregroundColor(foreground)
             } else {
                 Text(icon?.text ?? ".")
-                    .font(.system(size: size * 0.58, weight: .bold))
+                    .cmuxFont(size: size * 0.58, weight: .bold)
                     .foregroundColor(foreground)
             }
         }
@@ -11735,15 +11755,14 @@ struct VerticalTabsSidebar: View {
                         }
                     }
                 } label: {
-                    Image(systemName: isCollapsed ? "folder" : "folder.fill")
-                        .font(.system(size: 13, weight: .regular))
+                    CmuxSystemSymbolImage(magnified: isCollapsed ? "folder" : "folder.fill", pointSize: 13, weight: .regular)
                         .offset(y: -0.5)
                 }
                 .buttonStyle(.plain)
                 .safeHelp(String(localized: "sidebar.extension.toggleSection", defaultValue: "Toggle section"))
 
                 Text(extensionSidebarTreeSectionTitle(section.treeSection))
-                    .font(.system(size: 12, weight: .regular))
+                    .cmuxFont(size: 12, weight: .regular)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -11751,11 +11770,13 @@ struct VerticalTabsSidebar: View {
                 Spacer(minLength: 0)
 
                 if canCreateWorktree {
+                    let worktreeButtonSymbol = extensionSidebarWorktreeCreationInFlightSectionIds.contains(section.id)
+                        ? "clock"
+                        : "plus"
                     Button {
                         createExtensionWorktreeWorkspace(for: section.treeSection)
                     } label: {
-                        Image(systemName: extensionSidebarWorktreeCreationInFlightSectionIds.contains(section.id) ? "clock" : "plus")
-                            .font(.system(size: 11, weight: .regular))
+                        CmuxSystemSymbolImage(magnified: worktreeButtonSymbol, pointSize: 11, weight: .regular)
                             .frame(width: 18, height: 18)
                     }
                     .buttonStyle(.plain)
@@ -11844,12 +11865,20 @@ struct VerticalTabsSidebar: View {
         renderContext: WorkspaceListRenderContext,
         minHeight: CGFloat
     ) -> some View {
+        let shouldCollectWorkspaceDropTargets = SidebarDropPlanner().shouldCollectWorkspaceDropTargets(
+            draggedTabId: dragState.draggedTabId,
+            isBonsplitWorkspaceDropActive: isBonsplitWorkspaceDropTargetCollectionActive ||
+                isWorkspaceReorderDropTargetCollectionActive
+        )
         // Rows stay lazy + pinned top; `.frame(minHeight:)` fills the viewport
         // (#3241) or scrolls without measuring the LazyVStack. The prior
         // SidebarRowsFillLayout measured it (`sizeThatFits(height: nil)`) every
         // pass, realizing all rows and re-livelocking at scale (#2586 / #5764 /
         // #5845; regressed by #6033). Drop/tap = background; indicator on rows.
-        workspaceRows(renderContext: renderContext)
+        let content = workspaceRows(
+            renderContext: renderContext,
+            shouldCollectWorkspaceDropTargets: shouldCollectWorkspaceDropTargets
+        )
             .overlay(alignment: .bottom) {
                 if emptyAreaTopDropIndicatorVisible() {
                     Rectangle()
@@ -11886,25 +11915,37 @@ struct VerticalTabsSidebar: View {
                     lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
                     dragAutoScrollController: dragAutoScrollController,
                     topDropIndicatorVisible: false,
-                    tabDropDelegate: emptyAreaTabDropDelegate(renderContext: renderContext),
                     bonsplitDropIndicator: dropIndicatorBinding,
                     expandsVertically: true
                 )
             }
+
+        return rowsWithGatedDropTargetReader(
+            rows: content,
+            renderContext: renderContext,
+            shouldCollect: shouldCollectWorkspaceDropTargets
+        )
+        .overlay {
+            workspaceReorderDropOverlay(renderContext: renderContext)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .overlay {
+            bonsplitWorkspaceDropOverlay()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 
     @ViewBuilder
-    private func workspaceRows(renderContext: WorkspaceListRenderContext) -> some View {
+    private func workspaceRows(
+        renderContext: WorkspaceListRenderContext,
+        shouldCollectWorkspaceDropTargets: Bool
+    ) -> some View {
         let renderItems = renderContext.workspaceRenderItems
-        let shouldCollectWorkspaceDropTargets = SidebarDropPlanner().shouldCollectWorkspaceDropTargets(
-            draggedTabId: dragState.draggedTabId,
-            isBonsplitWorkspaceDropActive: isBonsplitWorkspaceDropTargetCollectionActive
-        )
         // LazyVStack is safe here because `dragState` is @Observable:
         // drag mutations at 60fps invalidate only the rows/overlays that
         // read them, never this sidebar body. See SidebarDragState and
         // https://github.com/manaflow-ai/cmux/issues/2586.
-        let rows = LazyVStack(spacing: tabRowSpacing) {
+        LazyVStack(spacing: tabRowSpacing) {
             ForEach(renderItems, id: \.id) { item in
                 switch item {
                 case .groupHeader(let group, let memberWorkspaceIds):
@@ -11929,23 +11970,6 @@ struct VerticalTabsSidebar: View {
         // total height (GeometryReader, or a custom Layout's sizeThatFits) fed a
         // non-converging relayout loop (#2586 / #5764 / #5845). Fill is handled
         // by `.frame(minHeight:)` in workspaceScrollContent.
-
-        // Gate ONLY the per-row frame-anchor *reader* (the virtualization-defeating
-        // work) behind the drag-active check, and keep the Bonsplit drop-capture
-        // overlay mounted *outside* that conditional. Returning the overlay from both
-        // branches of an `if`/`else` gives it distinct SwiftUI identity, so flipping the
-        // gate mid-drag (draggingEntered -> shouldCollect=true) tore down and recreated
-        // the drop NSView, orphaning the in-flight drag. Applying it at the stable outer
-        // level keeps the NSView identity-stable across gate flips. (#5325 review)
-        rowsWithGatedDropTargetReader(
-            rows: rows,
-            renderContext: renderContext,
-            shouldCollect: shouldCollectWorkspaceDropTargets
-        )
-        .overlay {
-            bonsplitWorkspaceDropOverlay()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
     }
 
     /// Conditionally installs the row-frame `overlayPreferenceValue` reader (the part
@@ -11962,13 +11986,32 @@ struct VerticalTabsSidebar: View {
             rows
                 .overlayPreferenceValue(SidebarWorkspaceRowFramePreferenceKey.self) { anchors in
                     GeometryReader { proxy in
-                        SidebarBonsplitTabWorkspaceDropOverlay.TargetWriter(
-                            targetBridge: bonsplitWorkspaceDropTargetBridge,
-                            targets: renderContext.tabs.compactMap { tab in
+                        let workspaceGroupsByAnchor = Dictionary(
+                            uniqueKeysWithValues: renderContext.workspaceGroups.map { ($0.anchorWorkspaceId, $0) }
+                        )
+                        SidebarWorkspaceDropTargetWriters(
+                            bonsplitTargetBridge: bonsplitWorkspaceDropTargetBridge,
+                            bonsplitTargets: renderContext.tabs.compactMap { tab in
                                 guard let anchor = anchors[tab.id] else { return nil }
                                 return SidebarDropPlanner.WorkspaceDropTarget(
                                     workspaceId: tab.id,
                                     isPinned: tab.isPinned,
+                                    frame: proxy[anchor]
+                                )
+                            },
+                            reorderTargetBridge: workspaceReorderDropTargetBridge,
+                            reorderTargets: renderContext.visibleWorkspaceRowIds.compactMap { workspaceId in
+                                guard let anchor = anchors[workspaceId],
+                                      renderContext.workspaceById[workspaceId] != nil else {
+                                    return nil
+                                }
+                                let group = workspaceGroupsByAnchor[workspaceId]
+                                let targetGroupId = group?.id ??
+                                    (renderContext.workspaceGroupIdByWorkspaceId[workspaceId] ?? nil)
+                                return SidebarWorkspaceReorderDropOverlay.Target(
+                                    workspaceId: workspaceId,
+                                    groupId: targetGroupId,
+                                    isGroupHeader: group != nil,
                                     frame: proxy[anchor]
                                 )
                             }
@@ -12031,6 +12074,264 @@ struct VerticalTabsSidebar: View {
         )
     }
 
+    private func workspaceReorderDropOverlay(
+        renderContext: WorkspaceListRenderContext,
+        pointOffset: CGSize = .zero
+    ) -> some View {
+        SidebarWorkspaceReorderDropOverlay(
+            targetBridge: workspaceReorderDropTargetBridge,
+            isValidDrag: {
+                activateSidebarWorkspaceDragIfNeeded()
+            },
+            updateDrag: { point, targets in
+                updateWorkspaceReorderDrop(point: point, targets: targets, renderContext: renderContext)
+            },
+            performDrop: { point, targets in
+                performWorkspaceReorderDrop(point: point, targets: targets, renderContext: renderContext)
+            },
+            clearDropIndicator: {
+                dragState.clearDropIndicator()
+                dragAutoScrollController.stop()
+            },
+            setWorkspaceDropTargetCollectionActive: { isActive in
+                guard isWorkspaceReorderDropTargetCollectionActive != isActive else { return }
+                isWorkspaceReorderDropTargetCollectionActive = isActive
+            },
+            pointOffset: pointOffset
+        )
+    }
+
+    private func activateSidebarWorkspaceDragIfNeeded() -> Bool {
+        if dragState.draggedTabId != nil {
+            return true
+        }
+        guard let foreignId = dragState.currentWorkspaceDragId,
+              !tabManager.tabs.contains(where: { $0.id == foreignId }),
+              let sourceManager = AppDelegate.shared?.tabManagerFor(tabId: foreignId),
+              !sourceManager.workspaceGroups.contains(where: { $0.anchorWorkspaceId == foreignId }) else {
+            return false
+        }
+        dragState.foreignDraggedIsPinned = sourceManager.tabs.first { $0.id == foreignId }?.isPinned ?? false
+        dragState.draggedTabId = foreignId
+        return true
+    }
+
+    private func updateWorkspaceReorderDrop(
+        point: CGPoint,
+        targets: [SidebarWorkspaceReorderDropOverlay.Target],
+        renderContext: WorkspaceListRenderContext
+    ) -> Bool {
+        guard activateSidebarWorkspaceDragIfNeeded(),
+              let plan = workspaceReorderPlan(point: point, targets: targets, renderContext: renderContext) else {
+            dragState.clearDropIndicator()
+            return false
+        }
+        dragAutoScrollController.updateFromDragLocation()
+        guard dragState.dropIndicator != plan.indicator ||
+                dragState.dropIndicatorScope != plan.indicatorScope else {
+            return true
+        }
+        dragState.setDropIndicator(plan.indicator, scope: plan.indicatorScope)
+        return true
+    }
+
+    private func performWorkspaceReorderDrop(
+        point: CGPoint,
+        targets: [SidebarWorkspaceReorderDropOverlay.Target],
+        renderContext: WorkspaceListRenderContext
+    ) -> Bool {
+        defer {
+            dragState.clearDrag()
+            dragAutoScrollController.stop()
+        }
+        guard activateSidebarWorkspaceDragIfNeeded(),
+              let plan = workspaceReorderPlan(point: point, targets: targets, renderContext: renderContext) else {
+            return false
+        }
+        return performWorkspaceReorderPlan(plan)
+    }
+
+    private func workspaceReorderPlan(
+        point: CGPoint,
+        targets: [SidebarWorkspaceReorderDropOverlay.Target],
+        renderContext: WorkspaceListRenderContext
+    ) -> SidebarWorkspaceReorderDropPlan? {
+        guard let draggedTabId = dragState.draggedTabId else { return nil }
+        return SidebarWorkspaceReorderDropResolver().plan(
+            for: SidebarWorkspaceReorderDropRequest(
+                point: point,
+                draggedWorkspaceId: draggedTabId,
+                foreignDraggedIsPinned: dragState.foreignDraggedIsPinned,
+                workspaces: renderContext.tabs.map {
+                    SidebarWorkspaceReorderWorkspaceSnapshot(
+                        id: $0.id,
+                        isPinned: $0.isPinned,
+                        groupId: $0.groupId
+                    )
+                },
+                groups: renderContext.workspaceGroups.map {
+                    SidebarWorkspaceReorderGroupSnapshot(
+                        id: $0.id,
+                        anchorWorkspaceId: $0.anchorWorkspaceId,
+                        isPinned: $0.isPinned
+                    )
+                },
+                targets: targets.map {
+                    SidebarWorkspaceReorderDropTarget(
+                        workspaceId: $0.workspaceId,
+                        groupId: $0.groupId,
+                        isGroupHeader: $0.isGroupHeader,
+                        frame: $0.frame
+                    )
+                }
+            )
+        )
+    }
+
+    private func performWorkspaceReorderPlan(_ plan: SidebarWorkspaceReorderDropPlan) -> Bool {
+        switch plan.action {
+        case .reorder(let targetIndex, let usesTopLevelRows, let explicitGroupId):
+            let selectionBeforeReorder = selectedTabIds
+            let anchorWorkspaceIdBeforeReorder = SidebarWorkspaceSelectionSyncPolicy().anchorWorkspaceId(
+                existingAnchorIndex: lastSidebarSelectionIndex,
+                liveWorkspaceIds: tabManager.tabs.map(\.id)
+            )
+            let didReorder = tabManager.reorderSidebarWorkspace(
+                tabId: plan.draggedWorkspaceId,
+                toIndex: targetIndex,
+                isDragOperation: true,
+                usesTopLevelRows: usesTopLevelRows,
+                explicitGroupId: explicitGroupId
+            )
+            syncSidebarSelectionAfterWorkspaceReorder(
+                preserving: selectionBeforeReorder,
+                preferredAnchorWorkspaceId: anchorWorkspaceIdBeforeReorder
+            )
+            return didReorder
+        case .crossWindow(insertionIndex: _, proposedInsertionIndex: let proposedInsertionIndex):
+            return performCrossWindowWorkspaceDrop(plan: plan, proposedInsertionIndex: proposedInsertionIndex)
+        }
+    }
+
+    private func performCrossWindowWorkspaceDrop(
+        plan: SidebarWorkspaceReorderDropPlan,
+        proposedInsertionIndex: Int
+    ) -> Bool {
+        guard let app = AppDelegate.shared,
+              let destinationWindowId = app.windowId(for: tabManager),
+              let sourceManager = app.tabManagerFor(tabId: plan.draggedWorkspaceId),
+              !sourceManager.workspaceGroups.contains(where: { $0.anchorWorkspaceId == plan.draggedWorkspaceId }) else {
+            return false
+        }
+
+        let sourceSelection = sourceManager.sidebarSelectedWorkspaceIds
+        let candidateIds: [UUID]
+        if sourceSelection.contains(plan.draggedWorkspaceId), sourceSelection.count > 1 {
+            candidateIds = sourceManager.tabs.filter { sourceSelection.contains($0.id) }.map(\.id)
+        } else {
+            candidateIds = [plan.draggedWorkspaceId]
+        }
+        let sourceAnchorIds = Set(sourceManager.workspaceGroups.map(\.anchorWorkspaceId))
+        let movingIds = candidateIds.filter { !sourceAnchorIds.contains($0) }
+        guard !movingIds.isEmpty else { return false }
+
+        let pinStateById = Dictionary(uniqueKeysWithValues: movingIds.map { id in
+            (id, sourceManager.tabs.first { $0.id == id }?.isPinned ?? false)
+        })
+        var movedIds: [UUID] = []
+        for isPinnedTier in [false, true] {
+            let tierIds = movingIds.filter { (pinStateById[$0] ?? false) == isPinnedTier }
+            guard !tierIds.isEmpty else { continue }
+            let topLevelIds = crossWindowTopLevelWorkspaceIds()
+            let slot = clampedCrossWindowTopLevelSlot(
+                proposedInsertionIndex,
+                draggedIsPinned: isPinnedTier,
+                topLevelIds: topLevelIds,
+                pinnedTopLevelIds: crossWindowTopLevelPinnedWorkspaceIds()
+            )
+            let base = crossWindowRawInsertIndex(forTopLevelSlot: slot, topLevelIds: topLevelIds)
+            var tierOffset = 0
+            for workspaceId in tierIds {
+                if app.moveWorkspaceToWindow(
+                    workspaceId: workspaceId,
+                    windowId: destinationWindowId,
+                    atIndex: base + tierOffset,
+                    focus: false
+                ) {
+                    movedIds.append(workspaceId)
+                    tierOffset += 1
+                }
+            }
+        }
+
+        guard !movedIds.isEmpty else { return false }
+        let focusId = movedIds.contains(plan.draggedWorkspaceId) ? plan.draggedWorkspaceId : (movedIds.last ?? plan.draggedWorkspaceId)
+        _ = app.moveWorkspaceToWindow(workspaceId: focusId, windowId: destinationWindowId, focus: true)
+        selectedTabIds = Set(movedIds)
+        if let selectedId = tabManager.selectedTabId {
+            lastSidebarSelectionIndex = tabManager.tabs.firstIndex { $0.id == selectedId }
+        } else {
+            lastSidebarSelectionIndex = nil
+        }
+        return true
+    }
+
+    private func clampedCrossWindowTopLevelSlot(
+        _ proposedSlot: Int,
+        draggedIsPinned: Bool,
+        topLevelIds: [UUID],
+        pinnedTopLevelIds: Set<UUID>
+    ) -> Int {
+        let clampedSlot = max(0, min(proposedSlot, topLevelIds.count))
+        let pinnedCount = topLevelIds.reduce(into: 0) { count, workspaceId in
+            if pinnedTopLevelIds.contains(workspaceId) {
+                count += 1
+            }
+        }
+        return draggedIsPinned ? min(clampedSlot, pinnedCount) : max(clampedSlot, pinnedCount)
+    }
+
+    private func crossWindowTopLevelWorkspaceIds() -> [UUID] {
+        tabManager.sidebarReorderWorkspaceIds(
+            forDraggedWorkspaceId: nil,
+            targetWorkspaceId: nil,
+            usesTopLevelRows: true
+        )
+    }
+
+    private func crossWindowTopLevelPinnedWorkspaceIds() -> Set<UUID> {
+        tabManager.sidebarReorderPinnedWorkspaceIds(
+            forDraggedWorkspaceId: nil,
+            targetWorkspaceId: nil,
+            usesTopLevelRows: true
+        )
+    }
+
+    private func crossWindowRawInsertIndex(forTopLevelSlot slot: Int, topLevelIds: [UUID]) -> Int {
+        guard slot < topLevelIds.count else { return tabManager.tabs.count }
+        let topLevelId = topLevelIds[slot]
+        return tabManager.tabs.firstIndex { $0.id == topLevelId } ?? tabManager.tabs.count
+    }
+
+    private func syncSidebarSelectionAfterWorkspaceReorder(
+        preserving previousSelectionIds: Set<UUID>,
+        preferredAnchorWorkspaceId: UUID?
+    ) {
+        let liveWorkspaceIds = tabManager.tabs.map(\.id)
+        let nextSelectionIds = SidebarWorkspaceSelectionSyncPolicy().reconciledSelection(
+            previousSelectionIds: previousSelectionIds,
+            liveWorkspaceIds: liveWorkspaceIds,
+            fallbackSelectedWorkspaceId: tabManager.selectedTabId
+        )
+        selectedTabIds = nextSelectionIds
+        lastSidebarSelectionIndex = SidebarWorkspaceSelectionSyncPolicy().anchorIndexAfterWorkspaceReorder(
+            preferredAnchorWorkspaceId: preferredAnchorWorkspaceId,
+            selectedWorkspaceIds: nextSelectionIds,
+            focusedWorkspaceId: tabManager.selectedTabId,
+            liveWorkspaceIds: liveWorkspaceIds
+        )
+    }
+
     @ViewBuilder
     private func workspaceRow(
         _ tab: Workspace,
@@ -12059,11 +12360,10 @@ struct VerticalTabsSidebar: View {
             anchorWorkspaceId: tab.id
         )
         let contextMenuPinState = WorkspaceActionDispatcher.pinState(
-            in: tabManager,
+            in: renderContext.pinResolutionContext,
             target: contextMenuPinTarget
         )
         let liveUnreadCount = sidebarUnread.unreadCount(forWorkspaceId: tab.id)
-        let liveHasMemoryWarning = sidebarUnread.hasMemoryWarning(forWorkspaceId: tab.id)
         let liveLatestNotificationText: String? = showsSidebarNotificationMessage
             ? sidebarUnread.latestNotificationText(forWorkspaceId: tab.id)
             : nil
@@ -12097,6 +12397,13 @@ struct VerticalTabsSidebar: View {
             dropIndicator: dragState.dropIndicator,
             tabIds: sidebarReorderIds
         )
+        let bottomDropIndicatorVisible = SidebarTabDropIndicatorPredicate().bottomVisible(
+            forTabId: tab.id,
+            draggedTabId: dragState.draggedTabId,
+            dropIndicator: dragState.dropIndicator,
+            tabIds: sidebarReorderIds,
+            indicatorScope: dragState.dropIndicatorScope
+        )
         let onDragStart: () -> NSItemProvider = { [tabId = tab.id] in
             #if DEBUG
             cmuxDebugLog("sidebar.onDrag tab=\(tabId.uuidString.prefix(5))")
@@ -12104,23 +12411,6 @@ struct VerticalTabsSidebar: View {
             dragState.beginDragging(tabId: tabId)
             return SidebarTabDragPayload.provider(for: tabId)
         }
-        let tabDropDelegateFactory: (CGFloat) -> SidebarTabDropDelegate = { [
-            tabId = tab.id,
-            selectedTabIds = $selectedTabIds,
-            lastSidebarSelectionIndex = $lastSidebarSelectionIndex
-        ] rowHeight in
-            SidebarTabDropDelegate(
-                targetTabId: tabId,
-                tabManager: tabManager,
-                workspaceGroupIdByWorkspaceId: renderContext.workspaceGroupIdByWorkspaceId,
-                dragState: dragState,
-                selectedTabIds: selectedTabIds,
-                lastSidebarSelectionIndex: lastSidebarSelectionIndex,
-                targetRowHeight: rowHeight,
-                dragAutoScrollController: dragAutoScrollController
-            )
-        }
-
         let row = TabItemView(
             tabManager: tabManager,
             notificationStore: notificationStore,
@@ -12134,7 +12424,6 @@ struct VerticalTabsSidebar: View {
             canCloseWorkspace: renderContext.canCloseWorkspace,
             accessibilityWorkspaceCount: renderContext.workspaceCount,
             unreadCount: liveUnreadCount,
-            hasMemoryWarning: liveHasMemoryWarning,
             latestNotificationText: liveLatestNotificationText,
             rowSpacing: tabRowSpacing,
             setSelectionToTabs: { selection = .tabs },
@@ -12144,8 +12433,8 @@ struct VerticalTabsSidebar: View {
             dragAutoScrollController: dragAutoScrollController,
             isBeingDragged: isBeingDragged,
             topDropIndicatorVisible: topDropIndicatorVisible,
+            bottomDropIndicatorVisible: bottomDropIndicatorVisible,
             onDragStart: onDragStart,
-            tabDropDelegateFactory: tabDropDelegateFactory,
             contextMenuWorkspaceIds: contextMenuWorkspaceIds,
             remoteContextMenuWorkspaceIds: remoteContextMenuWorkspaceIds,
             allRemoteContextMenuTargetsConnecting: allRemoteContextMenuTargetsConnecting,
@@ -12163,6 +12452,8 @@ struct VerticalTabsSidebar: View {
         row
             .sidebarWorkspaceFrameAnchor(id: tab.id, isEnabled: shouldCollectWorkspaceDropTargets)
             .padding(.leading, tab.groupId != nil ? SidebarWorkspaceGroupingMetrics.memberIndent : 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
     }
 
     private func debugShortSidebarTabId(_ id: UUID?) -> String {
@@ -12204,7 +12495,9 @@ struct SidebarWorkspaceRowFramePreferenceKey: PreferenceKey {
 @MainActor
 private final class SidebarDragFailsafeMonitor: ObservableObject {
     private static let escapeKeyCode: UInt16 = 53
-    private var pendingClearWorkItem: DispatchWorkItem?
+    // One-shot timer bridges synchronous AppKit event monitors to a cancellable drag-teardown deadline.
+    private var pendingClearTimer: DispatchSourceTimer?
+    private var pendingClearGeneration: UInt64 = 0
     private var appResignObserver: NSObjectProtocol?
     private var keyDownMonitor: Any?
     private var localMouseMonitor: Any?
@@ -12259,8 +12552,9 @@ private final class SidebarDragFailsafeMonitor: ObservableObject {
     }
 
     func stop() {
-        pendingClearWorkItem?.cancel()
-        pendingClearWorkItem = nil
+        pendingClearGeneration &+= 1
+        pendingClearTimer?.cancel()
+        pendingClearTimer = nil
         if let appResignObserver {
             NotificationCenter.default.removeObserver(appResignObserver)
             self.appResignObserver = nil
@@ -12281,19 +12575,26 @@ private final class SidebarDragFailsafeMonitor: ObservableObject {
     }
 
     private func requestClearSoon(reason: String) {
-        guard pendingClearWorkItem == nil else { return }
+        guard pendingClearTimer == nil else { return }
 #if DEBUG
         cmuxDebugLog("sidebar.dragFailsafe.schedule reason=\(reason)")
 #endif
-        let workItem = DispatchWorkItem { [weak self] in
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        pendingClearGeneration &+= 1
+        let generation = pendingClearGeneration
+        timer.schedule(deadline: .now() + SidebarDragFailsafePolicy.clearDelay)
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.pendingClearGeneration == generation else { return }
 #if DEBUG
-            cmuxDebugLog("sidebar.dragFailsafe.fire reason=\(reason)")
+                cmuxDebugLog("sidebar.dragFailsafe.fire reason=\(reason)")
 #endif
-            self?.pendingClearWorkItem = nil
-            self?.onRequestClear?(reason)
+                self.pendingClearTimer = nil
+                self.onRequestClear?(reason)
+            }
         }
-        pendingClearWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + SidebarDragFailsafePolicy.clearDelay, execute: workItem)
+        pendingClearTimer = timer
+        timer.resume()
     }
 }
 
@@ -12414,9 +12715,7 @@ private struct SidebarFooterButtons: View {
                         title: String(localized: "sidebar.extensions.browser.title", defaultValue: "Sidebar Extensions")
                     )
                 } label: {
-                    Image(systemName: "puzzlepiece.extension")
-                        .symbolRenderingMode(.monochrome)
-                        .font(.system(size: 12, weight: .medium))
+                    CmuxSystemSymbolImage(magnified: "puzzlepiece.extension", pointSize: 12, weight: .medium)
                         .foregroundStyle(Color(nsColor: .secondaryLabelColor))
                         .frame(width: 22, height: 22, alignment: .center)
                 }
@@ -12472,9 +12771,7 @@ private struct SidebarHelpMenuButton: View {
         Button {
             isPopoverPresented.toggle()
         } label: {
-            Image(systemName: "questionmark.circle")
-                .symbolRenderingMode(.monochrome)
-                .cmuxSymbolRasterSize(iconSize, weight: .medium)
+            CmuxSystemSymbolImage(systemName: "questionmark.circle", pointSize: iconSize, weight: .medium)
                 .foregroundStyle(Color(nsColor: .secondaryLabelColor))
                 .frame(width: buttonSize, height: buttonSize, alignment: .center)
         }
@@ -12586,7 +12883,7 @@ private struct SidebarHelpMenuButton: View {
         } label: {
             HStack(spacing: 8) {
                 Text(title)
-                    .font(.system(size: 12))
+                    .cmuxFont(size: 12)
                 Spacer(minLength: 0)
                 if let shortcutHint {
                     helpOptionShortcutHint(text: shortcutHint)
@@ -12610,14 +12907,13 @@ private struct SidebarHelpMenuButton: View {
         Text(text)
             .lineLimit(1)
             .fixedSize(horizontal: true, vertical: false)
-            .font(.system(size: 10, weight: .regular, design: .rounded))
+            .cmuxFont(size: 10, weight: .regular, design: .rounded)
             .monospacedDigit()
             .foregroundStyle(Color(nsColor: .secondaryLabelColor))
     }
 
     private func helpOptionTrailingIcon(systemName: String, size: CGFloat = 13) -> some View {
-        Image(systemName: systemName)
-            .cmuxSymbolRasterSize(size)
+        CmuxSystemSymbolImage(systemName: systemName, pointSize: size)
             .foregroundStyle(Color(nsColor: .secondaryLabelColor))
     }
 
@@ -12722,7 +13018,7 @@ private struct SidebarDevFooter: View {
             SidebarFooterButtons(updateViewModel: updateViewModel, fileExplorerState: fileExplorerState, onSendFeedback: onSendFeedback)
             if showSidebarDevBuildBanner {
                 Text(String(localized: "debug.devBuildBanner.title", defaultValue: "THIS IS A DEV BUILD"))
-                    .font(.system(size: 11, weight: .semibold))
+                    .cmuxFont(size: 11, weight: .semibold)
                     .foregroundColor(.red)
             }
         }
@@ -12743,13 +13039,36 @@ private struct SidebarEmptyArea: View {
     // Value snapshot + closure bundles instead of an @Observable store
     // reference (snapshot-boundary rule).
     let topDropIndicatorVisible: Bool
-    let tabDropDelegate: SidebarTabDropDelegate
+    var tabDropDelegate: SidebarTabDropDelegate? = nil
     let bonsplitDropIndicator: Binding<SidebarDropIndicator?>
     var expandsVertically = true
     var minimumHeight: CGFloat? = nil
 
     var body: some View {
-        hitTarget
+        dropTarget
+            .overlay {
+                SidebarBonsplitTabNewWorkspaceDropOverlay(
+                    tabManager: tabManager,
+                    selectedTabIds: $selectedTabIds,
+                    lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                    dropIndicator: bonsplitDropIndicator
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .overlay(alignment: .top) {
+                if topDropIndicatorVisible {
+                    Rectangle()
+                        .fill(cmuxAccentColor())
+                        .frame(height: 2)
+                        .padding(.horizontal, 8)
+                        .offset(y: -(rowSpacing / 2))
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var dropTarget: some View {
+        let base = hitTarget
             .onTapGesture(count: 2) {
                 // When the active workspace is a remote-tmux mirror, route through
                 // performNewWorkspaceAction so a new workspace becomes a new tmux
@@ -12772,25 +13091,11 @@ private struct SidebarEmptyArea: View {
                 }
                 selection = .tabs
             }
-            .onDrop(of: SidebarTabDragPayload.dropContentTypes, delegate: tabDropDelegate)
-            .overlay {
-                SidebarBonsplitTabNewWorkspaceDropOverlay(
-                    tabManager: tabManager,
-                    selectedTabIds: $selectedTabIds,
-                    lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                    dropIndicator: bonsplitDropIndicator
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .overlay(alignment: .top) {
-                if topDropIndicatorVisible {
-                    Rectangle()
-                        .fill(cmuxAccentColor())
-                        .frame(height: 2)
-                        .padding(.horizontal, 8)
-                        .offset(y: -(rowSpacing / 2))
-                }
-            }
+        if let tabDropDelegate {
+            base.onDrop(of: SidebarTabDragPayload.dropContentTypes, delegate: tabDropDelegate)
+        } else {
+            base
+        }
     }
 
     @ViewBuilder
@@ -12910,6 +13215,7 @@ struct SidebarWorkspaceSnapshotBuilder {
         let pullRequestRows: [PullRequestDisplay]
         let listeningPorts: [Int]
         let finderDirectoryPath: String?
+        let mediaActivity: BrowserMediaActivity
     }
 }
 
@@ -12932,7 +13238,6 @@ struct TabItemView: View, Equatable {
         lhs.canCloseWorkspace == rhs.canCloseWorkspace &&
         lhs.accessibilityWorkspaceCount == rhs.accessibilityWorkspaceCount &&
         lhs.unreadCount == rhs.unreadCount &&
-        lhs.hasMemoryWarning == rhs.hasMemoryWarning &&
         lhs.latestNotificationText == rhs.latestNotificationText &&
         lhs.rowSpacing == rhs.rowSpacing &&
         lhs.showsModifierShortcutHints == rhs.showsModifierShortcutHints &&
@@ -12944,6 +13249,7 @@ struct TabItemView: View, Equatable {
         lhs.workspaceGroupMenuSnapshot == rhs.workspaceGroupMenuSnapshot &&
         lhs.isBeingDragged == rhs.isBeingDragged &&
         lhs.topDropIndicatorVisible == rhs.topDropIndicatorVisible &&
+        lhs.bottomDropIndicatorVisible == rhs.bottomDropIndicatorVisible &&
         lhs.settings == rhs.settings
     }
 
@@ -12953,6 +13259,15 @@ struct TabItemView: View, Equatable {
     let tabManager: TabManager
     let notificationStore: TerminalNotificationStore
     @Environment(\.colorScheme) private var colorScheme
+    // Global font magnification percent, read once per row instead of through a
+    // per-label `CmuxFontModifier`. Each `.cmuxFont(...)` is a custom
+    // `@Environment`-reading `ViewModifier`; with 100+ workspaces continuously
+    // re-rendering rows under agent churn, ~20 of those per row multiplied the
+    // SwiftUI `DynamicBody`/environment node count the sidebar must re-evaluate
+    // on every render pass (issue #6612, regression from #6554). Reading the
+    // percent here and applying a primitive `.font(...)` keeps magnification
+    // working while dropping those per-label modifier bodies.
+    @Environment(\.cmuxGlobalFontMagnificationPercent) private var globalFontMagnificationPercent
     let tab: Tab
     let index: Int
     let workspaceShortcutDigit: Int?
@@ -12960,10 +13275,6 @@ struct TabItemView: View, Equatable {
     let canCloseWorkspace: Bool
     let accessibilityWorkspaceCount: Int
     let unreadCount: Int
-    /// True when any pane in this workspace is over the runaway-memory
-    /// threshold. Precomputed snapshot value (snapshot-boundary rule); drives
-    /// the orange warning badge alongside the unread badge.
-    let hasMemoryWarning: Bool
     let latestNotificationText: String?
     let rowSpacing: CGFloat
     let setSelectionToTabs: () -> Void
@@ -12979,11 +13290,8 @@ struct TabItemView: View, Equatable {
     // unchanged.
     let isBeingDragged: Bool
     let topDropIndicatorVisible: Bool
+    let bottomDropIndicatorVisible: Bool
     let onDragStart: () -> NSItemProvider
-    /// Factory invoked from `body` with the row's measured `rowHeight`. Closure
-    /// captures the parent's `dragState`, so TabItemView itself never holds an
-    /// `@Observable` store reference (snapshot-boundary rule).
-    let tabDropDelegateFactory: (CGFloat) -> SidebarTabDropDelegate
     let contextMenuWorkspaceIds: [UUID]
     let remoteContextMenuWorkspaceIds: [UUID]
     let allRemoteContextMenuTargetsConnecting: Bool
@@ -13104,6 +13412,30 @@ struct TabItemView: View, Equatable {
 
     private func scaledFontSize(_ baseSize: CGFloat) -> CGFloat {
         baseSize * fontScale
+    }
+
+    /// Resolves a system font scaled by the global magnification percent,
+    /// matching `CmuxFontModifier` exactly but without introducing a per-label
+    /// custom `ViewModifier` (and its `@Environment` attribute + `DynamicBody`)
+    /// for each `Text` in the row. The row reads the magnification percent once
+    /// (`globalFontMagnificationPercent`) and applies a primitive `.font(...)`,
+    /// removing ~20 redundant modifier bodies per row from the sidebar render
+    /// pass (issue #6612).
+    private func magnifiedFont(
+        _ baseSize: CGFloat,
+        weight: Font.Weight = .regular,
+        design: Font.Design = .default,
+        monospacedDigit: Bool = false
+    ) -> Font {
+        var font = Font.system(
+            size: GlobalFontMagnification.scaledSize(baseSize, percent: globalFontMagnificationPercent),
+            weight: weight,
+            design: design
+        )
+        if monospacedDigit {
+            font = font.monospacedDigit()
+        }
+        return font
     }
 
     private var showsLeadingRail: Bool {
@@ -13244,7 +13576,7 @@ struct TabItemView: View, Equatable {
                 .onAppear {
                     rowHeight = max(proxy.size.height, 1)
                 }
-                .onChange(of: proxy.size.height) { newHeight in
+                .onChange(of: proxy.size.height) { _, newHeight in
                     rowHeight = max(newHeight, 1)
                 }
         }
@@ -13257,7 +13589,7 @@ struct TabItemView: View, Equatable {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(remoteWorkspaceSidebarText)
-                        .font(.system(size: scaledFontSize(10), design: .monospaced))
+                        .font(magnifiedFont(scaledFontSize(10), design: .monospaced))
                         .foregroundColor(activeSecondaryColor(0.8))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -13265,7 +13597,7 @@ struct TabItemView: View, Equatable {
                     Spacer(minLength: 0)
 
                     Text(workspaceSnapshot.remoteConnectionStatusText)
-                        .font(.system(size: scaledFontSize(9), weight: .medium))
+                        .font(magnifiedFont(scaledFontSize(9), weight: .medium))
                         .foregroundColor(activeSecondaryColor(0.58))
                         .lineLimit(1)
 
@@ -13278,7 +13610,7 @@ struct TabItemView: View, Equatable {
                                 systemImage: "arrow.clockwise"
                             )
                             .labelStyle(.titleAndIcon)
-                            .font(.system(size: scaledFontSize(9), weight: .semibold))
+                            .font(magnifiedFont(scaledFontSize(9), weight: .semibold))
                         }
                         .buttonStyle(.borderless)
                         .foregroundColor(activeSecondaryColor(0.9))
@@ -13360,35 +13692,57 @@ struct TabItemView: View, Equatable {
                         Circle()
                             .fill(activeUnreadBadgeFillColor)
                         Text("\(unreadCount)")
-                            .font(.system(size: scaledFontSize(9), weight: .semibold))
+                            .font(magnifiedFont(scaledFontSize(9), weight: .semibold))
                             .foregroundColor(activeUnreadBadgeTextColor)
                     }
                     .frame(width: scaledUnreadBadgeSize, height: scaledUnreadBadgeSize)
                 }
 
-                if hasMemoryWarning {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: scaledFontSize(11), weight: .semibold))
-                        .foregroundColor(.orange)
-                        .safeHelp(String(
-                            localized: "sidebar.memoryWarning.tooltip",
-                            defaultValue: "A pane in this workspace is using a lot of memory"
-                        ))
-                        .accessibilityLabel(String(
-                            localized: "sidebar.memoryWarning.accessibilityLabel",
-                            defaultValue: "High memory warning"
-                        ))
-                }
-
                 if workspaceSnapshot.isPinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: scaledFontSize(9), weight: .semibold))
+                    CmuxSystemSymbolImage(magnified: "pin.fill", pointSize: scaledFontSize(9), weight: .semibold)
                         .foregroundColor(activeSecondaryColor(0.8))
                         .safeHelp(protectedWorkspaceTooltip)
                 }
 
+                // Chrome-style media-activity glyphs: a noisy or capturing
+                // background browser pane is surfaced on its workspace row,
+                // styled like the pin indicator. Audio is the must-have signal;
+                // mic/camera follow the macOS orange/green convention.
+                if workspaceSnapshot.mediaActivity.isPlayingAudio {
+                    let audioPlayingTooltip = String(
+                        localized: "sidebar.mediaActivity.audio.tooltip",
+                        defaultValue: "Playing audio"
+                    )
+                    CmuxSystemSymbolImage(magnified: "speaker.wave.2.fill", pointSize: scaledFontSize(9), weight: .semibold)
+                        .foregroundColor(activeSecondaryColor(0.8))
+                        .safeHelp(audioPlayingTooltip)
+                        .accessibilityLabel(audioPlayingTooltip)
+                }
+
+                if workspaceSnapshot.mediaActivity.isUsingMicrophone {
+                    let microphoneInUseTooltip = String(
+                        localized: "sidebar.mediaActivity.microphone.tooltip",
+                        defaultValue: "Microphone in use"
+                    )
+                    CmuxSystemSymbolImage(magnified: "mic.fill", pointSize: scaledFontSize(9), weight: .semibold)
+                        .foregroundColor(.orange)
+                        .safeHelp(microphoneInUseTooltip)
+                        .accessibilityLabel(microphoneInUseTooltip)
+                }
+
+                if workspaceSnapshot.mediaActivity.isUsingCamera {
+                    let cameraInUseTooltip = String(
+                        localized: "sidebar.mediaActivity.camera.tooltip",
+                        defaultValue: "Camera in use"
+                    )
+                    CmuxSystemSymbolImage(magnified: "video.fill", pointSize: scaledFontSize(9), weight: .semibold)
+                        .foregroundColor(.green)
+                        .safeHelp(cameraInUseTooltip)
+                        .accessibilityLabel(cameraInUseTooltip)
+                }
+
                 Text(displayedTitle)
-                    .font(.system(size: scaledFontSize(12.5), weight: titleFontWeight))
+                    .font(magnifiedFont(scaledFontSize(12.5), weight: titleFontWeight))
                     .foregroundColor(activePrimaryTextColor)
                     .lineLimit(titleLineLimit)
                     .truncationMode(.tail)
@@ -13408,8 +13762,7 @@ struct TabItemView: View, Equatable {
                         #endif
                         tabManager.closeWorkspaceWithConfirmation(tab)
                     }) {
-                        Image(systemName: "xmark")
-                            .cmuxSymbolRasterSize(scaledFontSize(9), weight: .medium)
+                        CmuxSystemSymbolImage(magnified: "xmark", pointSize: scaledFontSize(9), weight: .medium)
                             .foregroundColor(activeSecondaryColor(0.7))
                             .frame(width: scaledCloseButtonWidth, height: scaledCloseButtonHitSize, alignment: .center)
                             .contentShape(Rectangle())
@@ -13433,7 +13786,7 @@ struct TabItemView: View, Equatable {
 
             if let subtitle = effectiveSubtitle {
                 Text(subtitle)
-                    .font(.system(size: scaledFontSize(10)))
+                    .font(magnifiedFont(scaledFontSize(10)))
                     .foregroundColor(activeSecondaryColor(0.8))
                     .lineLimit(2)
                     .truncationMode(.tail)
@@ -13471,11 +13824,10 @@ struct TabItemView: View, Equatable {
 
             if detailVisibility.showsLog, let latestLog = workspaceSnapshot.latestLog {
                 HStack(spacing: 4) {
-                    Image(systemName: logLevelIcon(latestLog.level))
-                        .font(.system(size: scaledFontSize(8)))
+                    CmuxSystemSymbolImage(magnified: logLevelIcon(latestLog.level), pointSize: scaledFontSize(8))
                         .foregroundColor(logLevelColor(latestLog.level, isActive: usesInvertedActiveForeground))
                     Text(latestLog.message)
-                        .font(.system(size: scaledFontSize(10)))
+                        .font(magnifiedFont(scaledFontSize(10)))
                         .foregroundColor(activeSecondaryColor(0.8))
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -13498,7 +13850,7 @@ struct TabItemView: View, Equatable {
 
                     if let label = progress.label {
                         Text(label)
-                            .font(.system(size: scaledFontSize(9)))
+                            .font(magnifiedFont(scaledFontSize(9)))
                             .foregroundColor(activeSecondaryColor(0.6))
                             .lineLimit(1)
                     }
@@ -13512,8 +13864,7 @@ struct TabItemView: View, Equatable {
                     if !workspaceSnapshot.branchDirectoryLines.isEmpty {
                         HStack(alignment: .top, spacing: 3) {
                             if sidebarShowGitBranchIcon, workspaceSnapshot.branchLinesContainBranch {
-                                Image(systemName: "arrow.triangle.branch")
-                                    .font(.system(size: scaledFontSize(9)))
+                                CmuxSystemSymbolImage(magnified: "arrow.triangle.branch", pointSize: scaledFontSize(9))
                                     .foregroundColor(activeSecondaryColor(0.6))
                             }
                             VStack(alignment: .leading, spacing: 1) {
@@ -13521,7 +13872,7 @@ struct TabItemView: View, Equatable {
                                     if sidebarStacksBranchAndDirectory {
                                         if let branch = line.branch {
                                             Text(branch)
-                                                .font(.system(size: scaledFontSize(10), design: .monospaced))
+                                                .font(magnifiedFont(scaledFontSize(10), design: .monospaced))
                                                 .foregroundColor(activeSecondaryColor(0.75))
                                                 .lineLimit(1)
                                                 .truncationMode(.tail)
@@ -13537,14 +13888,13 @@ struct TabItemView: View, Equatable {
                                         HStack(spacing: 3) {
                                             if let branch = line.branch {
                                                 Text(branch)
-                                                    .font(.system(size: scaledFontSize(10), design: .monospaced))
+                                                    .font(magnifiedFont(scaledFontSize(10), design: .monospaced))
                                                     .foregroundColor(activeSecondaryColor(0.75))
                                                     .lineLimit(1)
                                                     .truncationMode(.tail)
                                             }
                                             if line.branch != nil, !line.directoryCandidates.isEmpty {
-                                                Image(systemName: "circle.fill")
-                                                    .font(.system(size: scaledFontSize(3)))
+                                                CmuxSystemSymbolImage(magnified: "circle.fill", pointSize: scaledFontSize(3))
                                                     .foregroundColor(activeSecondaryColor(0.6))
                                                     .padding(.horizontal, 1)
                                             }
@@ -13566,14 +13916,13 @@ struct TabItemView: View, Equatable {
                            || !workspaceSnapshot.compactDirectoryCandidates.isEmpty) {
                     HStack(alignment: .top, spacing: 3) {
                         if sidebarShowGitBranchIcon, workspaceSnapshot.compactGitBranchSummaryText != nil {
-                            Image(systemName: "arrow.triangle.branch")
-                                .font(.system(size: scaledFontSize(9)))
+                            CmuxSystemSymbolImage(magnified: "arrow.triangle.branch", pointSize: scaledFontSize(9))
                                 .foregroundColor(activeSecondaryColor(0.6))
                         }
                         VStack(alignment: .leading, spacing: 1) {
                             if let branchRow = workspaceSnapshot.compactGitBranchSummaryText {
                                 Text(branchRow)
-                                    .font(.system(size: scaledFontSize(10), design: .monospaced))
+                                    .font(magnifiedFont(scaledFontSize(10), design: .monospaced))
                                     .foregroundColor(activeSecondaryColor(0.75))
                                     .lineLimit(1)
                                     .truncationMode(.tail)
@@ -13590,8 +13939,7 @@ struct TabItemView: View, Equatable {
                 } else if !workspaceSnapshot.compactBranchDirectoryCandidates.isEmpty {
                     HStack(spacing: 3) {
                         if sidebarShowGitBranchIcon, workspaceSnapshot.compactGitBranchSummaryText != nil {
-                            Image(systemName: "arrow.triangle.branch")
-                                .font(.system(size: scaledFontSize(9)))
+                            CmuxSystemSymbolImage(magnified: "arrow.triangle.branch", pointSize: scaledFontSize(9))
                                 .foregroundColor(activeSecondaryColor(0.6))
                         }
                         SidebarDirectoryText(
@@ -13619,7 +13967,7 @@ struct TabItemView: View, Equatable {
                             Text(pullRequestStatusLabel(pullRequest.status)).lineLimit(1)
                             Spacer(minLength: 0)
                         }
-                        .font(.system(size: scaledFontSize(10), weight: .semibold))
+                        .font(magnifiedFont(scaledFontSize(10), weight: .semibold))
                         .foregroundColor(pullRequestForegroundColor)
                         .opacity(pullRequest.isStale ? 0.5 : 1)
                         if settings.makesPullRequestsClickable {
@@ -13652,7 +14000,7 @@ struct TabItemView: View, Equatable {
                     }
                     Spacer(minLength: 0)
                 }
-                .font(.system(size: scaledFontSize(10), design: .monospaced))
+                .font(magnifiedFont(scaledFontSize(10), design: .monospaced))
                 .foregroundColor(activeSecondaryColor(0.75))
                 .lineLimit(1)
             }
@@ -13663,7 +14011,7 @@ struct TabItemView: View, Equatable {
         // row is always animating, so the sidebar-wide layout re-runs at display
         // refresh rate (#5764 / #5845). Lazy rows must be height-stable after
         // they appear; content changes now apply in one discrete layout pass.
-        .padding(.horizontal, 10)
+        .padding(.horizontal, SidebarWorkspaceListMetrics.rowContentHorizontalPadding)
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 6)
@@ -13691,7 +14039,7 @@ struct TabItemView: View, Equatable {
             fontSize: scaledFontSize(10)
         )
         .shortcutHintVisibilityAnimation(value: showsWorkspaceShortcutHint)
-        .padding(.horizontal, 6)
+        .padding(.horizontal, SidebarWorkspaceListMetrics.rowOuterHorizontalPadding)
         .background { rowHeightProbe }
         .contentShape(Rectangle())
         .opacity(isBeingDragged ? 0.6 : 1)
@@ -13713,6 +14061,14 @@ struct TabItemView: View, Equatable {
                 rowSpacing: rowSpacing
             )
         }
+        .overlay(alignment: .bottom) {
+            SidebarWorkspaceTopDropIndicator(
+                isVisible: bottomDropIndicatorVisible,
+                isFirstRow: false,
+                rowSpacing: rowSpacing,
+                isBottomEdge: true
+            )
+        }
         .onAppear {
             updateObservedActiveState(tabManager.selectedTabId == tab.id)
             refreshWorkspaceSnapshot(force: true)
@@ -13721,7 +14077,6 @@ struct TabItemView: View, Equatable {
             tabManager.selectedTabIdPublisher
                 .map { $0 == tab.id }
                 .removeDuplicates()
-                .receive(on: RunLoop.main)
         ) { isSelected in
             updateObservedActiveState(isSelected)
         }
@@ -13772,7 +14127,6 @@ struct TabItemView: View, Equatable {
         }
         .onDrag(onDragStart)
         .internalOnlyTabDrag()
-        .onDrop(of: SidebarTabDragPayload.dropContentTypes, delegate: tabDropDelegateFactory(rowHeight))
         .onDrop(of: BonsplitTabDragPayload.dropContentTypes, delegate: SidebarBonsplitTabDropDelegate(
             targetWorkspaceId: tab.id,
             tabManager: tabManager,
@@ -14447,7 +14801,8 @@ struct TabItemView: View, Equatable {
             branchLinesContainBranch: branchLinesContainBranch,
             pullRequestRows: pullRequestRows,
             listeningPorts: detailVisibility.showsPorts ? tab.listeningPorts : [],
-            finderDirectoryPath: WorkspaceFinderDirectoryResolver.path(for: tab)
+            finderDirectoryPath: WorkspaceFinderDirectoryResolver.path(for: tab),
+            mediaActivity: tab.browserMediaActivity
         )
     }
 
@@ -14731,8 +15086,7 @@ struct TabItemView: View, Equatable {
                     .scaleEffect(fontScale)
                     .frame(width: customFrameSize, height: customFrameSize)
             case .closed:
-                Image(systemName: "xmark.circle")
-                    .font(.system(size: 7 * fontScale, weight: .regular))
+                CmuxSystemSymbolImage(magnified: "xmark.circle", pointSize: 7 * fontScale, weight: .regular)
                     .foregroundColor(color)
                     .frame(width: closedFrameSize, height: closedFrameSize)
             }
@@ -14912,7 +15266,7 @@ private struct SidebarWorkspaceDescriptionText: View {
                 Text(displayMarkdown)
             }
         }
-        .font(.system(size: 10.5 * fontScale))
+        .cmuxFont(size: 10.5 * fontScale)
         .foregroundColor(foregroundColor)
         .multilineTextAlignment(.leading)
         .lineLimit(Self.maxDisplayedLines)
@@ -15022,7 +15376,7 @@ private struct SidebarMetadataRows: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .font(.system(size: 10 * fontScale, weight: .semibold))
+                .cmuxFont(size: 10 * fontScale, weight: .semibold)
                 .foregroundColor(isActive ? activeSecondaryForegroundColor : .secondary.opacity(0.9))
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -15086,7 +15440,7 @@ private struct SidebarMetadataEntryRow: View {
                 .truncationMode(.tail)
             Spacer(minLength: 0)
         }
-        .font(.system(size: 10 * fontScale))
+        .cmuxFont(size: 10 * fontScale)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -15110,12 +15464,12 @@ private struct SidebarMetadataEntryRow: View {
         if iconRaw.hasPrefix("emoji:") {
             let value = String(iconRaw.dropFirst("emoji:".count))
             guard !value.isEmpty else { return nil }
-            return AnyView(Text(value).font(.system(size: 9 * fontScale)))
+            return AnyView(Text(value).cmuxFont(size: 9 * fontScale))
         }
         if iconRaw.hasPrefix("text:") {
             let value = String(iconRaw.dropFirst("text:".count))
             guard !value.isEmpty else { return nil }
-            return AnyView(Text(value).font(.system(size: 8 * fontScale, weight: .semibold)))
+            return AnyView(Text(value).cmuxFont(size: 8 * fontScale, weight: .semibold))
         }
         let symbolName: String
         if iconRaw.hasPrefix("sf:") {
@@ -15124,7 +15478,7 @@ private struct SidebarMetadataEntryRow: View {
             symbolName = iconRaw
         }
         guard !symbolName.isEmpty else { return nil }
-        return AnyView(Image(systemName: symbolName).cmuxSymbolRasterSize(8 * fontScale, weight: .medium))
+        return AnyView(CmuxSystemSymbolImage(magnified: symbolName, pointSize: 8 * fontScale, weight: .medium))
     }
 
     @ViewBuilder
@@ -15178,7 +15532,7 @@ private struct SidebarMetadataMarkdownBlocks: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .font(.system(size: 10 * fontScale, weight: .semibold))
+                .cmuxFont(size: 10 * fontScale, weight: .semibold)
                 .foregroundColor(isActive ? activeSecondaryForegroundColor : .secondary.opacity(0.9))
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -15220,7 +15574,7 @@ private struct SidebarMetadataMarkdownBlockRow: View {
                     .foregroundColor(foregroundColor)
             }
         }
-        .font(.system(size: 10 * fontScale))
+        .cmuxFont(size: 10 * fontScale)
         .multilineTextAlignment(.leading)
         .lineLimit(Self.maxDisplayedLines)
         .truncationMode(.tail)
@@ -15554,15 +15908,15 @@ struct SidebarTabDropDelegate: DropDelegate {
 #if DEBUG
         cmuxDebugLog("sidebar.dropExited target=\(targetTabId?.uuidString.prefix(5) ?? "end")")
 #endif
-        if dragState.dropIndicator?.tabId == targetTabId {
-            dragState.clearDropIndicator()
-        }
+        // SwiftUI can emit row exits while a valid drag is still over the
+        // sidebar, especially after indicator state invalidates row overlays.
+        // Hover updates and drag-end own indicator changes.
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         activateForeignDragIfNeeded()
         dragAutoScrollController.updateFromDragLocation()
-        updateDropIndicator(for: info)
+        updateDropIndicator(pointerX: info.location.x, pointerY: plannerPointerY(for: info))
 #if DEBUG
         cmuxDebugLog(
             "sidebar.dropUpdated target=\(targetTabId?.uuidString.prefix(5) ?? "end") " +
@@ -15573,8 +15927,18 @@ struct SidebarTabDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        performDrop(
+            pointerX: info.location.x,
+            pointerY: plannerPointerY(for: info),
+            shouldClearDrag: true
+        )
+    }
+
+    func performDrop(pointerX: CGFloat, pointerY: CGFloat?, shouldClearDrag: Bool = true) -> Bool {
         defer {
-            dragState.clearDrag()
+            if shouldClearDrag {
+                dragState.clearDrag()
+            }
             dragAutoScrollController.stop()
         }
         #if DEBUG
@@ -15589,25 +15953,33 @@ struct SidebarTabDropDelegate: DropDelegate {
         if isCrossWindowDrag(draggedTabId) {
             return performCrossWindowDrop(draggedTabId: draggedTabId)
         }
-        let usesTopLevelRows = tabManager.sidebarReorderUsesTopLevelRows(
+        let defaultUsesTopLevelRows = tabManager.sidebarReorderUsesTopLevelRows(
             forDraggedWorkspaceId: draggedTabId,
             targetWorkspaceId: targetTabId,
             workspaceGroupIdByWorkspaceId: workspaceGroupIdByWorkspaceId
         )
+        let explicitGroupId: UUID? = nil
+        let usesTopLevelRows = usesTopLevelRowsForDrop(
+            draggedTabId: draggedTabId,
+            explicitGroupId: explicitGroupId,
+            defaultUsesTopLevelRows: defaultUsesTopLevelRows
+        )
+        let plannerTargetTabId = plannerTargetTabId(usesTopLevelRows: usesTopLevelRows)
         let reorderTabIds = tabManager.sidebarReorderWorkspaceIds(
             forDraggedWorkspaceId: draggedTabId,
-            targetWorkspaceId: targetTabId,
+            targetWorkspaceId: plannerTargetTabId,
             usesTopLevelRows: usesTopLevelRows
         )
         let pinnedTabIds = tabManager.sidebarReorderPinnedWorkspaceIds(
             forDraggedWorkspaceId: draggedTabId,
-            targetWorkspaceId: targetTabId,
+            targetWorkspaceId: plannerTargetTabId,
             usesTopLevelRows: usesTopLevelRows
         )
         let legalInsertionRange = tabManager.sidebarReorderLegalInsertionRange(
             forDraggedWorkspaceId: draggedTabId,
-            targetWorkspaceId: targetTabId,
-            usesTopLevelRows: usesTopLevelRows
+            targetWorkspaceId: plannerTargetTabId,
+            usesTopLevelRows: usesTopLevelRows,
+            explicitGroupId: explicitGroupId
         )
         guard let fromIndex = reorderTabIds.firstIndex(of: draggedTabId) else {
 #if DEBUG
@@ -15617,7 +15989,7 @@ struct SidebarTabDropDelegate: DropDelegate {
         }
         guard let targetIndex = SidebarDropPlanner().targetIndex(
             draggedTabId: draggedTabId,
-            targetTabId: targetTabId,
+            targetTabId: plannerTargetTabId,
             indicator: dragState.dropIndicator,
             tabIds: reorderTabIds,
             pinnedTabIds: pinnedTabIds,
@@ -15632,7 +16004,7 @@ struct SidebarTabDropDelegate: DropDelegate {
             return false
         }
 
-        guard fromIndex != targetIndex else {
+        guard fromIndex != targetIndex || explicitGroupId != nil else {
 #if DEBUG
             cmuxDebugLog("sidebar.drop.noop from=\(fromIndex) to=\(targetIndex)")
 #endif
@@ -15651,13 +16023,52 @@ struct SidebarTabDropDelegate: DropDelegate {
             tabId: draggedTabId,
             toIndex: targetIndex,
             isDragOperation: true,
-            usesTopLevelRows: usesTopLevelRows
+            usesTopLevelRows: usesTopLevelRows,
+            explicitGroupId: explicitGroupId
         )
         syncSidebarSelection(
             preserving: selectionBeforeReorder,
             preferredAnchorWorkspaceId: anchorWorkspaceIdBeforeReorder
         )
         return didReorder
+    }
+
+    private func usesTopLevelRowsForDrop(
+        draggedTabId: UUID?,
+        explicitGroupId: UUID?,
+        defaultUsesTopLevelRows: Bool
+    ) -> Bool {
+        guard explicitGroupId == nil else { return false }
+        guard !defaultUsesTopLevelRows else { return true }
+        guard let draggedTabId,
+              tabManager.tabs.contains(where: { $0.id == draggedTabId }),
+              let targetTabId,
+              let targetGroupId = workspaceGroupIdByWorkspaceId[targetTabId] ?? nil,
+              let group = tabManager.workspaceGroups.first(where: { $0.id == targetGroupId }),
+              group.anchorWorkspaceId != targetTabId else {
+            return false
+        }
+        return true
+    }
+
+    private func plannerTargetTabId(usesTopLevelRows: Bool) -> UUID? {
+        guard usesTopLevelRows,
+              let targetTabId,
+              let targetGroupId = workspaceGroupIdByWorkspaceId[targetTabId] ?? nil,
+              let group = tabManager.workspaceGroups.first(where: { $0.id == targetGroupId }),
+              group.anchorWorkspaceId != targetTabId else {
+            return targetTabId
+        }
+        return group.anchorWorkspaceId
+    }
+
+    private func plannerPointerY(for info: DropInfo) -> CGFloat? {
+        return plannerPointerY(pointerY: info.location.y)
+    }
+
+    private func plannerPointerY(pointerY: CGFloat?) -> CGFloat? {
+        guard targetTabId != nil else { return nil }
+        return pointerY
     }
 
     /// Move a workspace dragged in from another window into this window at the
@@ -15752,39 +16163,52 @@ struct SidebarTabDropDelegate: DropDelegate {
     }
 
     private func updateDropIndicator(for info: DropInfo) {
+        updateDropIndicator(pointerX: info.location.x, pointerY: plannerPointerY(for: info))
+    }
+
+    func updateDropIndicator(pointerX: CGFloat, pointerY: CGFloat?) {
         if let draggedTabId = effectiveDraggedTabId, isCrossWindowDrag(draggedTabId) {
-            updateCrossWindowDropIndicator(for: info)
+            updateCrossWindowDropIndicator(pointerY: pointerY)
             return
         }
-        let usesTopLevelRows = tabManager.sidebarReorderUsesTopLevelRows(
+        let defaultUsesTopLevelRows = tabManager.sidebarReorderUsesTopLevelRows(
             forDraggedWorkspaceId: dragState.draggedTabId,
             targetWorkspaceId: targetTabId,
             workspaceGroupIdByWorkspaceId: workspaceGroupIdByWorkspaceId
         )
+        let explicitGroupId: UUID? = nil
+        let usesTopLevelRows = usesTopLevelRowsForDrop(
+            draggedTabId: dragState.draggedTabId,
+            explicitGroupId: explicitGroupId,
+            defaultUsesTopLevelRows: defaultUsesTopLevelRows
+        )
+        let plannerTargetTabId = plannerTargetTabId(usesTopLevelRows: usesTopLevelRows)
         let tabIds = tabManager.sidebarReorderWorkspaceIds(
             forDraggedWorkspaceId: dragState.draggedTabId,
-            targetWorkspaceId: targetTabId,
+            targetWorkspaceId: plannerTargetTabId,
             usesTopLevelRows: usesTopLevelRows
         )
         let pinnedTabIds = tabManager.sidebarReorderPinnedWorkspaceIds(
             forDraggedWorkspaceId: dragState.draggedTabId,
-            targetWorkspaceId: targetTabId,
+            targetWorkspaceId: plannerTargetTabId,
             usesTopLevelRows: usesTopLevelRows
         )
         let legalInsertionRange = tabManager.sidebarReorderLegalInsertionRange(
             forDraggedWorkspaceId: dragState.draggedTabId,
-            targetWorkspaceId: targetTabId,
-            usesTopLevelRows: usesTopLevelRows
+            targetWorkspaceId: plannerTargetTabId,
+            usesTopLevelRows: usesTopLevelRows,
+            explicitGroupId: explicitGroupId
         )
-        let nextIndicator = SidebarDropPlanner().indicator(
+        let plannedIndicator = SidebarDropPlanner().indicator(
             draggedTabId: dragState.draggedTabId,
-            targetTabId: targetTabId,
+            targetTabId: plannerTargetTabId,
             tabIds: tabIds,
             pinnedTabIds: pinnedTabIds,
             legalInsertionRange: legalInsertionRange,
-            pointerY: targetTabId == nil ? nil : info.location.y,
+            pointerY: pointerY,
             targetHeight: targetRowHeight
         )
+        let nextIndicator = plannedIndicator
         let nextUsesTopLevelRows = nextIndicator != nil && usesTopLevelRows
         guard dragState.dropIndicator != nextIndicator ||
                 dragState.dropIndicatorUsesTopLevelRows != nextUsesTopLevelRows else {
@@ -15796,7 +16220,7 @@ struct SidebarTabDropDelegate: DropDelegate {
     /// Drop indicator for a foreign workspace hovering this window. The dragged
     /// workspace is not in this window's list, so the reorder planner (which
     /// removes a source index) does not apply — use the cross-window planner.
-    private func updateCrossWindowDropIndicator(for info: DropInfo) {
+    private func updateCrossWindowDropIndicator(pointerY: CGFloat?) {
         // Reuse the pin state stashed when the foreign drag was mirrored in,
         // avoiding a per-pointer-move cross-window lookup.
         let draggedIsPinned = dragState.foreignDraggedIsPinned ?? false
@@ -15808,7 +16232,7 @@ struct SidebarTabDropDelegate: DropDelegate {
             indicator: nil,
             tabIds: crossWindowTopLevelTabIds(),
             pinnedTabIds: crossWindowTopLevelPinnedTabIds(),
-            pointerY: targetTabId == nil ? nil : info.location.y,
+            pointerY: targetTabId == nil ? nil : pointerY,
             targetHeight: targetRowHeight
         ).indicator
         let usesTopLevelRows = !tabManager.workspaceGroups.isEmpty
