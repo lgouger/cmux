@@ -1,3 +1,4 @@
+import CMUXAgentLaunch
 import Foundation
 import CmuxCore
 import Testing
@@ -9,18 +10,157 @@ import Testing
 #endif
 
 @Suite struct SessionPersistenceResumeBindingTests {
-    @Test func agentHookSurfaceResumeStartupInputPreservesCustomAbsoluteAgentExecutable() throws {
+    @Test func structuredLaunchCaptureRoundTripsAdditively() throws {
+        let binding = SurfaceResumeBindingSnapshot(
+            name: "Codex",
+            kind: "codex",
+            command: "codex resume legacy-display-command",
+            cwd: "/tmp/项目 with 'quotes'",
+            checkpointId: "a22293b7-bcef-4707-8439-2f538c8517a4",
+            source: "agent-hook",
+            environment: ["CODEX_HOME": "/tmp/配置"],
+            launchCommand: AgentLaunchCommandSnapshot(
+                launcher: "codex",
+                executablePath: "/opt/company bin/codex",
+                arguments: [
+                    "/opt/company bin/codex",
+                    "--model",
+                    "gpt-5.6-sol",
+                    "日本語",
+                ],
+                workingDirectory: "/tmp/项目 with 'quotes'",
+                environment: ["CODEX_HOME": "/tmp/配置"],
+                capturedAt: 123,
+                source: "process"
+            ),
+            autoResume: true
+        )
+
+        let decoded = try JSONDecoder().decode(
+            SurfaceResumeBindingSnapshot.self,
+            from: JSONEncoder().encode(binding)
+        )
+
+        #expect(decoded == binding)
+        #expect(decoded.launchCommand?.arguments == binding.launchCommand?.arguments)
+        #expect(decoded.command.contains("codex resume legacy-display-command"))
+    }
+
+    @Test func v06420CommandOnlyBindingStillProducesRestoreVerb() throws {
+        let json = """
+        {
+          "name": "Legacy custom agent",
+          "kind": "custom-agent",
+          "command": "legacy-agent --resume 'old checkpoint'",
+          "cwd": "/tmp/legacy",
+          "checkpointId": "old checkpoint",
+          "source": "agent-hook",
+          "environment": {"LEGACY_VALUE": "preserved"},
+          "autoResume": true,
+          "approvalPolicy": "auto",
+          "approvalRecordId": "legacy-approval",
+          "updatedAt": 1
+        }
+        """
+        let binding = try JSONDecoder().decode(
+            SurfaceResumeBindingSnapshot.self,
+            from: Data(json.utf8)
+        )
+
+        #expect(binding.launchCommand == nil)
+        #expect(binding.permissionMode == nil)
+        #expect(binding.launchFlavor == .local)
+        #expect(binding.wasDecodedWithoutLaunchFlavor)
+        #expect(binding.environment == ["LEGACY_VALUE": "preserved"])
+        #expect(
+            binding.restoreStartupInput()
+                == " \(AgentRestoreLaunch.cliStartupExecutableToken) restore --surface\n"
+        )
+    }
+
+    @Test func localRestoreUsesOneShortCLICommandRegardlessOfBindingSize() throws {
+        let sessionId = "a22293b7-bcef-4707-8439-2f538c8517a4"
         let binding = SurfaceResumeBindingSnapshot(
             kind: "codex",
-            command: "'/opt/company/bin/codex' 'resume' 'session-custom-cli'",
-            checkpointId: "session-custom-cli",
+            command: "codex resume \(sessionId) " + String(repeating: "--config model_provider=subrouter ", count: 80),
+            checkpointId: sessionId,
+            source: "agent-hook",
+            autoResume: true
+        )
+
+        let startupInput = try #require(binding.restoreStartupInput())
+
+        #expect(
+            startupInput
+                == " \(AgentRestoreLaunch.cliStartupExecutableToken) restore codex \(sessionId)\n"
+        )
+    }
+
+    @Test(arguments: ["codex", "claude"])
+    func agentHookRestoreBindingCarriesProviderAndSessionBoundAuthorization(kind: String) throws {
+        let sessionId = "a22293b7-bcef-4707-8439-2f538c8517a4"
+        let resumeArgument = kind == "codex" ? "resume" : "--resume"
+        let binding = SurfaceResumeBindingSnapshot(
+            kind: kind,
+            command: "'/opt/company/bin/\(kind)' '\(resumeArgument)' '\(sessionId)'",
+            checkpointId: sessionId,
+            source: "agent-hook",
+            autoResume: true
+        )
+
+        let startupInput = try #require(binding.inlineStartupInput)
+        #expect(
+            startupInput.contains("/usr/bin/env 'CMUX_AGENT_RESTORE_LAUNCH=\(kind):\(sessionId)'"),
+            "\(startupInput)"
+        )
+        #expect(startupInput.contains("CMUX_\(kind.uppercased())_WRAPPER_SHIM"), "\(startupInput)")
+        #expect(startupInput.contains("CMUX_CUSTOM_\(kind.uppercased())_PATH="), "\(startupInput)")
+    }
+
+    @Test func restoreBindingAuthorizationRejectsUnownedOrUnboundCommands() throws {
+        let sessionId = "a22293b7-bcef-4707-8439-2f538c8517a4"
+        let nonHook = SurfaceResumeBindingSnapshot(
+            kind: "codex",
+            command: "codex resume '\(sessionId)'",
+            checkpointId: sessionId,
+            source: "cli",
+            autoResume: true
+        )
+        let unsupported = SurfaceResumeBindingSnapshot(
+            kind: "gemini",
+            command: "gemini --resume '\(sessionId)'",
+            checkpointId: sessionId,
+            source: "agent-hook",
+            autoResume: true
+        )
+        let invalidSession = SurfaceResumeBindingSnapshot(
+            kind: "claude",
+            command: "claude --resume not-a-session-id",
+            checkpointId: "not-a-session-id",
+            source: "agent-hook",
+            autoResume: true
+        )
+
+        #expect(try #require(nonHook.inlineStartupInput).contains("CMUX_AGENT_RESTORE_LAUNCH") == false)
+        #expect(try #require(unsupported.inlineStartupInput).contains("CMUX_AGENT_RESTORE_LAUNCH") == false)
+        #expect(try #require(invalidSession.inlineStartupInput).contains("CMUX_AGENT_RESTORE_LAUNCH") == false)
+    }
+
+    @Test func agentHookSurfaceResumeRoutesCustomExecutableThroughWrapper() throws {
+        let sessionId = "a22293b7-bcef-4707-8439-2f538c8517a4"
+        let binding = SurfaceResumeBindingSnapshot(
+            kind: "codex",
+            command: "'/opt/company/bin/codex' 'resume' '\(sessionId)'",
+            checkpointId: sessionId,
             source: "agent-hook",
             autoResume: true
         )
 
         let startupInput = try #require(binding.startupInput)
 
-        #expect(startupInput.contains("'/opt/company/bin/codex'"), "\(startupInput)")
+        #expect(startupInput.contains("CMUX_CODEX_WRAPPER_SHIM"), "\(startupInput)")
+        #expect(startupInput.contains("CMUX_CUSTOM_CODEX_PATH="), "\(startupInput)")
+        #expect(startupInput.contains("/opt/company/bin/codex"), "\(startupInput)")
     }
 
     @Test func decodingAgentHookBindingRewritesPersistedPATHManagedAgentExecutable() throws {
@@ -261,8 +401,7 @@ import Testing
                 autoResume: true
             )
 
-            let startupInput = try #require(binding.startupInputWithLauncherScript(
-                allowLauncherScript: false,
+            let startupInput = try #require(binding.inlineStartupInput(
                 repairPortableAgentExecutable: false
             ))
             #expect(
@@ -272,7 +411,14 @@ import Testing
         }
     }
 
-    @Test @MainActor func remoteWorkspaceLocalTerminalResumeBindingUsesLocalRepair() throws {
+    @Test @MainActor func remoteWorkspaceLocalTerminalResumeBindingUsesShortLocalRestoreVerb() throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("cmux-local-resume-binding-\(UUID().uuidString)", isDirectory: true)
+        let localDirectoryURL = root.appendingPathComponent("local repo", isDirectory: true)
+        try fileManager.createDirectory(at: localDirectoryURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
         let suiteName = "cmux-session-resume-binding-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -299,7 +445,7 @@ import Testing
             autoConnect: false
         )
         let paneId = try #require(remoteWorkspace.bonsplitController.allPaneIds.first)
-        let localDirectory = "/tmp/cmux-local-resume-binding"
+        let localDirectory = localDirectoryURL.path
         let localPanel = try #require(remoteWorkspace.newTerminalSurface(
             inPane: paneId,
             focus: true,
@@ -317,7 +463,7 @@ import Testing
         )
         let oversizedArgument = String(
             repeating: "x",
-            count: SurfaceResumeBindingSnapshot.maxInlineStartupInputBytes + 1
+            count: 901
         )
         let quotedDirectory = "'\(localDirectory)'"
         #expect(remoteWorkspace.setSurfaceResumeBinding(
@@ -349,12 +495,15 @@ import Testing
                 .panels.first { $0.customTitle == "Local Resume Shell" }
         )
         let restoredPanel = try #require(restoredWorkspace.terminalPanel(for: restoredLocalPanel.id))
-        let restoredInput = try #require(restoredPanel.surface.debugInitialInputForTesting())
         #expect(restoredPanel.surface.debugInitialCommand() == nil)
-        #expect(restoredPanel.requestedWorkingDirectory == nil)
-        #expect(restoredInput.contains("codex 'resume' 'session-local-resume'"), "\(restoredInput)")
-        #expect(restoredInput.contains(localDirectory), "\(restoredInput)")
-        #expect(!restoredInput.contains(staleExecutablePath), "\(restoredInput)")
+        let restoredInput = try #require(restoredPanel.surface.debugInitialInputForTesting())
+        #expect(restoredPanel.requestedWorkingDirectory == localDirectory)
+        #expect(
+            restoredInput
+                == " \(AgentRestoreLaunch.cliStartupExecutableToken) restore codex session-local-resume\n"
+        )
+        #expect(!restoredInput.contains(staleExecutablePath))
+        #expect(!restoredInput.contains(oversizedArgument))
     }
 
     @Test func agentHookSurfaceResumeStartupInputPreservesExistingPATHManagedAgentExecutable() throws {
@@ -441,7 +590,7 @@ import Testing
         #expect(process.terminationStatus == 0, "\(errorText)")
 
         let output = try String(contentsOf: outputURL, encoding: .utf8)
-        #expect(output == "\(cwd.path)|resume session-moved-cli --yolo\n")
+        #expect(output == "\(cwd.path)|resume session-moved-cli -c check_for_update_on_startup=false --yolo\n")
         #expect(!startupInput.contains(movedExecutable.path), "\(startupInput)")
     }
 
